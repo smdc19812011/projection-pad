@@ -24,10 +24,10 @@ try:
         QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout,
         QMenu, QAction, QDialog, QComboBox, QMessageBox,
         QToolButton, QSlider, QListWidget, QListWidgetItem,
-        QGroupBox, QLineEdit, QDialogButtonBox,
+        QGroupBox, QLineEdit, QDialogButtonBox, QShortcut,
     )
     from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-    from PyQt5.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPalette
+    from PyQt5.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPalette, QKeySequence
 except ImportError:
     sys.exit("PyQt5 required:  pip install PyQt5")
 
@@ -448,6 +448,11 @@ class PadWidget(QFrame):
         self.name = QLabel(self.cfg.display_name)
         self.name.setObjectName("Name")
 
+        self.sc_lbl = QLabel(f"Ctrl+{self.cfg.index + 1}")
+        self.sc_lbl.setObjectName("ShortcutLbl")
+        self.sc_lbl.setFixedWidth(44)
+        self.sc_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.btn = QToolButton()
         self.btn.setText("⚙")
         self.btn.setObjectName("Gear")
@@ -456,7 +461,11 @@ class PadWidget(QFrame):
 
         fl.addWidget(self.dot)
         fl.addWidget(self.name, 1)
+        fl.addWidget(self.sc_lbl)
         fl.addWidget(self.btn)
+
+        self.setToolTip(
+            f"Pad {self.cfg.index + 1}  •  Shortcut: Ctrl+{self.cfg.index + 1}")
 
         vl.addWidget(self.preview, 1)
         vl.addWidget(footer)
@@ -469,7 +478,7 @@ class PadWidget(QFrame):
         p.setPen(QColor(C_DIM))
         p.setFont(QFont("Segoe UI,Inter,sans-serif", 10))
         p.drawText(pm.rect(), Qt.AlignCenter,
-                   f"Pad {self.cfg.index + 1}\n⚙  to configure")
+                   f"Pad {self.cfg.index + 1}\n⚙  to configure\nCtrl+{self.cfg.index + 1}")
         p.end()
         self.preview.setPixmap(pm)
 
@@ -538,6 +547,11 @@ QToolButton#Gear{{
   font-size:12px;
 }}
 QToolButton#Gear:hover{{color:{C_TEXT}}}
+QLabel#ShortcutLbl{{
+  color:{C_BORDER};
+  font-size:9px;
+  background:transparent;
+}}
 """)
 
     def mousePressEvent(self, e):
@@ -975,6 +989,8 @@ class Main(QMainWindow):
         self._build()
         self._refresh()
         self._start_worker()
+        # Auto-switch to extend mode after UI renders
+        QTimer.singleShot(600, self._init_display)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -1018,6 +1034,16 @@ class Main(QMainWindow):
             gl.addWidget(pw, i // PAD_COLS, i % PAD_COLS)
         vl.addWidget(gw, 1)
 
+        # Keyboard shortcuts ───────────────────────────────────────────────────
+        for i in range(MAX_PADS):
+            sc = QShortcut(QKeySequence(f"Ctrl+{i + 1}"), self)
+            sc.activated.connect(lambda idx=i: self._pad_click(idx))
+        QShortcut(QKeySequence("Ctrl+P"), self).activated.connect(self._project)
+        QShortcut(QKeySequence("Ctrl+Shift+P"), self).activated.connect(self._stop)
+        QShortcut(QKeySequence("Ctrl+R"), self).activated.connect(self._refresh)
+        QShortcut(QKeySequence("Ctrl+D"), self).activated.connect(
+            self._display_settings)
+
         # Controls ─────────────────────────────────────────────────────────────
         ctrl = QWidget(); ctrl.setObjectName("Controls"); ctrl.setFixedHeight(56)
         cl   = QHBoxLayout(ctrl); cl.setContentsMargins(20, 10, 20, 10); cl.setSpacing(12)
@@ -1053,7 +1079,8 @@ class Main(QMainWindow):
         cl.addWidget(refresh_btn); cl.addWidget(self.proj_btn); cl.addWidget(self.stop_btn)
         vl.addWidget(ctrl)
 
-        self.statusBar().showMessage("Ready — select a pad to begin")
+        self.statusBar().showMessage(
+            "Ready — Ctrl+1–8 select pad  •  Ctrl+P project  •  Ctrl+Shift+P stop  •  Ctrl+R refresh  •  Ctrl+D display")
 
         # Auto-refresh window list every 10 s
         self._src_timer = QTimer()
@@ -1178,6 +1205,23 @@ class Main(QMainWindow):
         self.fps_lbl2.setText(f"{v} fps")
         if self.worker:
             self.worker.set_fps(v)
+
+    def _init_display(self):
+        """On Windows: if no external display is visible yet, switch to extend mode."""
+        if PLATFORM != "Windows":
+            return
+        if len(QApplication.screens()) < 2:
+            try:
+                subprocess.Popen(
+                    ["DisplaySwitch.exe", "/extend"],
+                    creationflags=0x08000000,  # CREATE_NO_WINDOW
+                )
+            except Exception:
+                pass
+            # Re-detect after the display switch settles
+            QTimer.singleShot(1500, self._refresh)
+        else:
+            self._refresh()
 
     def _on_proj_frame(self, px: QPixmap):
         if self.projector and self.projector.isVisible() and self.selected is not None:
