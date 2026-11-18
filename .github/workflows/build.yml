@@ -1,0 +1,54 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:     [ 'v*' ]
+  workflow_dispatch:        # lets you trigger manually from GitHub UI
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install PyQt5 mss pywin32 pyinstaller
+
+      - name: Build exe
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "ProjectionPad" `
+            --hidden-import=PyQt5.sip `
+            --hidden-import=mss `
+            --hidden-import=mss.windows `
+            --hidden-import=win32gui `
+            --hidden-import=win32process `
+            --hidden-import=win32api `
+            --hidden-import=win32con `
+            --collect-submodules=mss `
+            projection_pad.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProjectionPad-Windows
+          path: dist/ProjectionPad.exe
+          retention-days: 30
+
+      # Also attach to a GitHub Release when you push a tag (e.g. v1.0)
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/ProjectionPad.exe

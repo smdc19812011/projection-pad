@@ -1,0 +1,6 @@
+PyQt5>=5.15
+mss>=9.0
+# Optional for better image quality:
+# Pillow>=10.0
+# Windows only (window enumeration):
+# pywin32>=306
