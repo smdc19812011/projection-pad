@@ -40,7 +40,8 @@ PLATFORM = platform.system()   # 'Windows' | 'Darwin' | 'Linux'
 
 if PLATFORM == "Windows":
     try:
-        import win32gui, win32process, win32api
+        import win32gui, win32process, win32api, win32ui, win32con
+        import ctypes
         HAS_WIN32 = True
     except ImportError:
         HAS_WIN32 = False
@@ -226,22 +227,71 @@ class Bridge:
 # ── capture engine ────────────────────────────────────────────────────────────
 
 class Capture:
-    """Thread-safe screenshot capture via mss."""
+    """Thread-safe screenshot capture via mss (screens) and PrintWindow (windows on Windows)."""
 
     _lock = threading.Lock()
 
     @classmethod
     def grab(cls, x: int, y: int, w: int, h: int) -> Optional[QPixmap]:
+        """Capture a screen region by coordinates (used for full-screen/display pads)."""
         if w <= 0 or h <= 0:
             return None
         try:
             with cls._lock:
                 with mss.mss() as sct:
                     img = sct.grab({"top": y, "left": x, "width": w, "height": h})
-                    # mss returns BGRA bytes; QImage.Format_ARGB32 expects BGRA on little-endian
                     qi = QImage(bytes(img.bgra), img.width, img.height,
                                 img.width * 4, QImage.Format_ARGB32)
                     return QPixmap.fromImage(qi)
+        except Exception:
+            return None
+
+    @classmethod
+    def grab_window_win32(cls, hwnd_str: str) -> Optional[QPixmap]:
+        """Capture a specific window using PrintWindow — works even when the window
+        is behind other windows, minimised, or on a different virtual desktop."""
+        if not HAS_WIN32:
+            return None
+        try:
+            hwnd = int(hwnd_str)
+            if not win32gui.IsWindow(hwnd):
+                return None
+
+            # Restore if minimised so PrintWindow gets real dimensions
+            placement = win32gui.GetWindowPlacement(hwnd)
+            was_minimised = (placement[1] == win32con.SW_SHOWMINIMIZED)
+            if was_minimised:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            rect = win32gui.GetWindowRect(hwnd)
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+            if w <= 0 or h <= 0:
+                return None
+
+            hwnd_dc  = win32gui.GetWindowDC(hwnd)
+            mfc_dc   = win32ui.CreateDCFromHandle(hwnd_dc)
+            mem_dc   = mfc_dc.CreateCompatibleDC()
+            bmp      = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+            mem_dc.SelectObject(bmp)
+
+            # PW_RENDERFULLCONTENT (2) captures hardware-accelerated content (Chrome, etc.)
+            ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), 2)
+
+            info = bmp.GetInfo()
+            data = bmp.GetBitmapBits(True)
+
+            win32gui.DeleteObject(bmp.GetHandle())
+            mem_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+
+            if was_minimised:
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+
+            qi = QImage(data, info['bmWidth'], info['bmHeight'], QImage.Format_ARGB32)
+            return QPixmap.fromImage(qi)
         except Exception:
             return None
 
@@ -256,11 +306,17 @@ class Capture:
                 return None
         if cfg.stype == SourceType.WINDOW:
             try:
-                w = next(w for w in windows if w.id == cfg.sid)
-                if w.bounds:
-                    return cls.grab(*w.bounds)
+                win = next(w for w in windows if w.id == cfg.sid)
             except StopIteration:
                 return None
+            # On Windows use PrintWindow for accurate per-window capture
+            if PLATFORM == "Windows" and HAS_WIN32:
+                px = cls.grab_window_win32(win.id)
+                if px:
+                    return px
+            # Fallback: capture the screen region the window occupies
+            if win.bounds:
+                return cls.grab(*win.bounds)
         return None
 
 # ── capture worker thread ─────────────────────────────────────────────────────
