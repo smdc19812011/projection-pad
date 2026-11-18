@@ -51,7 +51,7 @@ else:
 # ── constants ─────────────────────────────────────────────────────────────────
 
 APP_NAME    = "Projection Pad"
-VERSION     = "1.0"
+VERSION     = "1.1"
 MAX_PADS    = 8
 PAD_COLS    = 4
 DEFAULT_FPS = 2
@@ -361,6 +361,52 @@ class CaptureThread(QThread):
             dt = time.time() - t0
             time.sleep(max(0.0, 1.0 / self._fps - dt))
 
+# ── projector capture thread (high-FPS, single pad) ──────────────────────────
+
+class ProjectorThread(QThread):
+    """Dedicated capture loop for the active projected pad at screen refresh rate."""
+    frame = pyqtSignal(QPixmap)
+
+    def __init__(self):
+        super().__init__()
+        self._cfg: Optional[PadConfig] = None
+        self._screens: List[ScreenInfo] = []
+        self._windows: List[WinInfo]    = []
+        self._fps    = 60
+        self._live   = False
+        self._mu     = threading.Lock()
+
+    def set_target(self, cfg: PadConfig, screens: List[ScreenInfo],
+                   windows: List[WinInfo]):
+        with self._mu:
+            self._cfg     = cfg
+            self._screens = screens[:]
+            self._windows = windows[:]
+
+    def update_sources(self, screens: List[ScreenInfo], windows: List[WinInfo]):
+        with self._mu:
+            self._screens = screens[:]
+            self._windows = windows[:]
+
+    def set_fps(self, fps: int):
+        self._fps = max(1, min(fps, 120))
+
+    def stop(self):
+        self._live = False
+
+    def run(self):
+        self._live = True
+        while self._live:
+            t0 = time.time()
+            with self._mu:
+                cfg, ss, ws = self._cfg, self._screens[:], self._windows[:]
+            if cfg and cfg.stype != SourceType.EMPTY:
+                px = Capture.for_pad(cfg, ss, ws)
+                if px:
+                    self.frame.emit(px)
+            dt = time.time() - t0
+            time.sleep(max(0.0, 1.0 / self._fps - dt))
+
 # ── pad widget ────────────────────────────────────────────────────────────────
 
 class PadWidget(QFrame):
@@ -665,6 +711,171 @@ class ConfigDialog(QDialog):
 
         self.accept()
 
+# ── display settings dialog ───────────────────────────────────────────────────
+
+class DisplaySettingsDialog(QDialog):
+    """Enumerate and apply resolution / refresh rate for an external display."""
+
+    def __init__(self, screen: Optional[ScreenInfo], parent=None):
+        super().__init__(parent)
+        self._screen = screen
+        self.setWindowTitle("Display Settings")
+        self.setModal(True)
+        self.setFixedSize(420, 300)
+        self.setStyleSheet(_DLGSS)
+        self._modes: List[tuple] = []   # (width, height, hz)
+        self._build()
+
+    def _build(self):
+        vl = QVBoxLayout(self)
+        vl.setSpacing(10)
+        vl.setContentsMargins(16, 16, 16, 16)
+
+        if self._screen:
+            cur = self._current_mode()
+            if cur:
+                hz_note = f" @ {cur[2]} Hz" if cur[2] else ""
+                info_txt = f"{self._screen.name}  —  current: {cur[0]}×{cur[1]}{hz_note}"
+            else:
+                info_txt = (f"{self._screen.name}  —  "
+                            f"{self._screen.bounds[2]}×{self._screen.bounds[3]}")
+        else:
+            info_txt = "No external display detected"
+
+        info = QLabel(info_txt)
+        info.setStyleSheet(
+            f"color:{C_DIM};font-size:11px;background:{C_SURFACE2};"
+            f"padding:8px;border-radius:4px;border:1px solid {C_BORDER}")
+        vl.addWidget(info)
+
+        if self._screen and HAS_WIN32:
+            self._modes = self._enum_modes()
+
+        # Resolution row
+        r1 = QHBoxLayout()
+        lbl1 = QLabel("Resolution:")
+        lbl1.setFixedWidth(100)
+        self.res_cb = QComboBox()
+        r1.addWidget(lbl1); r1.addWidget(self.res_cb, 1)
+        vl.addLayout(r1)
+
+        # Refresh rate row
+        r2 = QHBoxLayout()
+        lbl2 = QLabel("Refresh Rate:")
+        lbl2.setFixedWidth(100)
+        self.hz_cb = QComboBox()
+        r2.addWidget(lbl2); r2.addWidget(self.hz_cb, 1)
+        vl.addLayout(r2)
+
+        if self._modes:
+            self._fill_res()
+            self.res_cb.currentIndexChanged.connect(self._fill_hz)
+        else:
+            reason = "Windows + pywin32 required" if not HAS_WIN32 else "no modes found"
+            self.res_cb.addItem(f"({reason})")
+            self.hz_cb.addItem("—")
+            self.res_cb.setEnabled(False)
+            self.hz_cb.setEnabled(False)
+
+        # Buttons
+        btns = QHBoxLayout()
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        self.ok_btn = QPushButton("Apply"); self.ok_btn.setObjectName("OK")
+        self.ok_btn.setEnabled(bool(self._modes))
+        self.ok_btn.clicked.connect(self._apply)
+        btns.addStretch(); btns.addWidget(cancel); btns.addWidget(self.ok_btn)
+        vl.addStretch(); vl.addLayout(btns)
+
+    def _enum_modes(self) -> List[tuple]:
+        if not (HAS_WIN32 and self._screen):
+            return []
+        try:
+            device = QApplication.screens()[self._screen.index].name()
+            seen, modes = set(), []
+            i = 0
+            while True:
+                try:
+                    dm = win32api.EnumDisplaySettings(device, i)
+                    if dm.BitsPerPel >= 24:
+                        key = (dm.PelsWidth, dm.PelsHeight, dm.DisplayFrequency)
+                        if key not in seen:
+                            seen.add(key); modes.append(key)
+                    i += 1
+                except Exception:
+                    break
+            modes.sort(key=lambda m: (m[0] * m[1], m[2]), reverse=True)
+            return modes
+        except Exception:
+            return []
+
+    def _current_mode(self) -> Optional[tuple]:
+        if not (HAS_WIN32 and self._screen):
+            return None
+        try:
+            device = QApplication.screens()[self._screen.index].name()
+            dm = win32api.EnumDisplaySettings(device, 0xFFFFFFFF)
+            return (dm.PelsWidth, dm.PelsHeight, dm.DisplayFrequency)
+        except Exception:
+            return None
+
+    def _fill_res(self):
+        self.res_cb.blockSignals(True); self.res_cb.clear()
+        seen = {}
+        cur = self._current_mode()
+        best = -1
+        for idx, (w, h, hz) in enumerate(self._modes):
+            if (w, h) not in seen:
+                seen[(w, h)] = self.res_cb.count()
+                self.res_cb.addItem(f"{w}×{h}", (w, h))
+                if cur and cur[0] == w and cur[1] == h:
+                    best = self.res_cb.count() - 1
+        if best >= 0:
+            self.res_cb.setCurrentIndex(best)
+        self.res_cb.blockSignals(False)
+        self._fill_hz()
+
+    def _fill_hz(self):
+        self.hz_cb.clear()
+        data = self.res_cb.currentData()
+        if not data:
+            return
+        w, h = data
+        cur = self._current_mode()
+        best = -1
+        for mw, mh, hz in self._modes:
+            if mw == w and mh == h:
+                self.hz_cb.addItem(f"{hz} Hz", hz)
+                if cur and cur[0] == w and cur[1] == h and cur[2] == hz:
+                    best = self.hz_cb.count() - 1
+        if best >= 0:
+            self.hz_cb.setCurrentIndex(best)
+
+    def _apply(self):
+        if not (self._screen and HAS_WIN32):
+            self.accept(); return
+        res = self.res_cb.currentData()
+        hz  = self.hz_cb.currentData()
+        if not res or not hz:
+            return
+        w, h = res
+        try:
+            device = QApplication.screens()[self._screen.index].name()
+            dm = win32api.EnumDisplaySettings(device, 0xFFFFFFFF)
+            dm.PelsWidth = w; dm.PelsHeight = h; dm.DisplayFrequency = hz
+            dm.Fields = 0x80000 | 0x100000 | 0x400000  # DM_PELSWIDTH|HEIGHT|FREQ
+            result = win32api.ChangeDisplaySettingsEx(device, dm, 2)  # CDS_TEST
+            if result < 0:
+                QMessageBox.warning(self, "Cannot Apply",
+                    "This resolution/refresh combination is not supported.")
+                return
+            win32api.ChangeDisplaySettingsEx(device, dm, 0)
+            if result == 1:
+                QMessageBox.information(self, "Applied",
+                    "Mode changed. A restart may be needed for full effect.")
+            self.accept()
+        except Exception as ex:
+            QMessageBox.critical(self, "Error", str(ex))
+
 # ── projector output window ───────────────────────────────────────────────────
 
 class Projector(QMainWindow):
@@ -758,6 +969,8 @@ class Main(QMainWindow):
         self.screens: List[ScreenInfo]    = []
         self.windows: List[WinInfo]       = []
         self.worker: Optional[CaptureThread] = None
+        self.proj_worker: Optional[ProjectorThread] = None
+        self._proj_fps: int = 60
         self.setStyleSheet(_MAINSS)
         self._build()
         self._refresh()
@@ -834,6 +1047,9 @@ class Main(QMainWindow):
 
         cl.addWidget(fps_lbl); cl.addWidget(self.fps_sl); cl.addWidget(self.fps_lbl2)
         cl.addStretch()
+        self.disp_btn = QPushButton("⚙  Display")
+        self.disp_btn.clicked.connect(self._display_settings)
+        cl.addWidget(self.disp_btn)
         cl.addWidget(refresh_btn); cl.addWidget(self.proj_btn); cl.addWidget(self.stop_btn)
         vl.addWidget(ctrl)
 
@@ -854,9 +1070,17 @@ class Main(QMainWindow):
             self.worker.set_sources(self.screens, self.windows)
         ext = Bridge.external_screen()
         if ext:
+            qt_screens = QApplication.screens()
+            if ext.index < len(qt_screens):
+                self._proj_fps = round(qt_screens[ext.index].refreshRate())
+            if self.proj_worker and self.proj_worker.isRunning():
+                self.proj_worker.update_sources(self.screens, self.windows)
+                self.proj_worker.set_fps(self._proj_fps)
             self.di.setText(
-                f"🖥  {len(self.screens)} displays  •  External: {ext.name}")
+                f"🖥  {len(self.screens)} displays  •  "
+                f"External: {ext.name}  •  {self._proj_fps} Hz")
         else:
+            self._proj_fps = 60
             self.di.setText(
                 f"🖥  {len(self.screens)} display(s) — no external detected")
         self.statusBar().showMessage(
@@ -871,8 +1095,6 @@ class Main(QMainWindow):
     def _on_frame(self, idx: int, px: QPixmap):
         if 0 <= idx < len(self.pad_widgets):
             self.pad_widgets[idx].set_frame(px)
-        if idx == self.selected and self.projector and self.projector.isVisible():
-            self.projector.push(px, self.pads[idx].display_name)
 
     def _pad_click(self, idx: int):
         cfg = self.pads[idx]
@@ -913,12 +1135,26 @@ class Main(QMainWindow):
             self.pad_widgets[i].set_state(
                 projected=cfg.projected, selected=(i == self.selected))
 
+        pad = self.pads[self.selected]
+        # Start or update the dedicated high-FPS projector capture thread
+        if self.proj_worker is None:
+            self.proj_worker = ProjectorThread()
+            self.proj_worker.frame.connect(self._on_proj_frame)
+        self.proj_worker.set_target(pad, self.screens, self.windows)
+        self.proj_worker.set_fps(self._proj_fps)
+        if not self.proj_worker.isRunning():
+            self.proj_worker.start()
+
         self.proj_btn.setText("⟳  Projecting…")
         self.stop_btn.setEnabled(True)
-        pad = self.pads[self.selected]
-        self.statusBar().showMessage(f"Projecting: {pad.display_name}")
+        self.statusBar().showMessage(
+            f"Projecting: {pad.display_name}  •  {self._proj_fps} fps")
 
     def _stop(self):
+        if self.proj_worker:
+            self.proj_worker.stop()
+            self.proj_worker.wait(1000)
+            self.proj_worker = None
         if self.projector:
             self.projector.hide()
         for i, cfg in enumerate(self.pads):
@@ -943,7 +1179,20 @@ class Main(QMainWindow):
         if self.worker:
             self.worker.set_fps(v)
 
+    def _on_proj_frame(self, px: QPixmap):
+        if self.projector and self.projector.isVisible() and self.selected is not None:
+            self.projector.push(px, self.pads[self.selected].display_name)
+
+    def _display_settings(self):
+        ext = Bridge.external_screen()
+        dlg = DisplaySettingsDialog(ext, self)
+        dlg.exec_()
+        self._refresh()
+
     def closeEvent(self, e):
+        if self.proj_worker:
+            self.proj_worker.stop()
+            self.proj_worker.wait(2000)
         if self.worker:
             self.worker.stop()
             self.worker.wait(2000)
