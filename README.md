@@ -6,6 +6,9 @@ Up to **8 configurable pads**, each showing a window or entire display.
 Click a pad → click **Project** → it fills your HDMI/external screen.  
 Switch pads anytime to change what the audience sees.
 
+Makes the task of transitioning windows, opening files on the background
+while presenting easy and without the need for a second laptop or PC.
+
 ## Run from source
 
 ```bash
