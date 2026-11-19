@@ -40,6 +40,10 @@ try:
 except ImportError:
     sys.exit("mss required:  pip install mss")
 
+import urllib.request as _url_req
+import json as _json
+import zipfile as _zipfile
+
 PLATFORM = platform.system()   # 'Windows' | 'Darwin' | 'Linux'
 
 if PLATFORM == "Windows":
@@ -101,6 +105,15 @@ C_WEBCAM   = "#FF9F0A"   # Elgato signature orange
 # Webcam pad indices (zero-based)
 WEBCAM_PAD_SCREEN = 6
 WEBCAM_PAD_VIDEO  = 7
+
+# ── driver / config paths ──────────────────────────────────────────────────────
+
+_APP_DATA_DIR = os.path.join(
+    os.getenv("APPDATA", os.path.expanduser("~")), "ProjectionPad")
+_DRIVER_DIR   = os.path.join(_APP_DATA_DIR, "drivers")
+_CONFIG_FILE  = os.path.join(_APP_DATA_DIR, "config.json")
+_UNITY_API    = "https://api.github.com/repos/schellingb/UnityCapture/releases/latest"
+_UNITY_DLL    = "UnityCaptureFilter.x64.dll"
 
 # ── data models ────────────────────────────────────────────────────────────────
 
@@ -482,10 +495,13 @@ class WebcamThread(QThread):
             return
         cam_w = max((px.width()  // 2) * 2, 640)
         cam_h = max((px.height() // 2) * 2, 480)
+        _backend = AppConfig.get("webcam_driver", "")
+        _cam_kw: dict = dict(width=cam_w, height=cam_h, fps=30,
+                             fmt=pyvirtualcam.PixelFormat.RGB, print_fps=False)
+        if _backend == "unity":
+            _cam_kw["backend"] = "unitycapture"
         try:
-            with pyvirtualcam.Camera(width=cam_w, height=cam_h, fps=30,
-                                     fmt=pyvirtualcam.PixelFormat.RGB,
-                                     print_fps=False) as cam:
+            with pyvirtualcam.Camera(**_cam_kw) as cam:
                 _prev_tick = 0
                 while self._live:
                     with self._mu:
@@ -548,10 +564,13 @@ class WebcamThread(QThread):
             )
         except (FileNotFoundError, OSError):
             pass
+        _backend = AppConfig.get("webcam_driver", "")
+        _cam_kw2: dict = dict(width=cam_w, height=cam_h, fps=int(fps),
+                              fmt=pyvirtualcam.PixelFormat.RGB, print_fps=False)
+        if _backend == "unity":
+            _cam_kw2["backend"] = "unitycapture"
         try:
-            with pyvirtualcam.Camera(width=cam_w, height=cam_h, fps=int(fps),
-                                     fmt=pyvirtualcam.PixelFormat.RGB,
-                                     print_fps=False) as cam:
+            with pyvirtualcam.Camera(**_cam_kw2) as cam:
                 frame_num    = 0
                 prev_interval = max(1, int(fps // 5))
                 while self._live:
@@ -847,6 +866,214 @@ QPushButton#OK{{background:{C_ACCENT};border:none;color:#FFFFFF;font-weight:600}
 QPushButton#OK:hover{{background:#333333}}
 """
 
+# ── app config (persists to %APPDATA%\ProjectionPad\config.json) ───────────────
+
+class AppConfig:
+    _data: dict = {}
+
+    @classmethod
+    def load(cls):
+        try:
+            with open(_CONFIG_FILE, "r") as f:
+                cls._data = _json.load(f)
+        except Exception:
+            cls._data = {}
+
+    @classmethod
+    def get(cls, key: str, default=None):
+        return cls._data.get(key, default)
+
+    @classmethod
+    def set(cls, key: str, value):
+        cls._data[key] = value
+        cls._save()
+
+    @classmethod
+    def _save(cls):
+        try:
+            os.makedirs(_APP_DATA_DIR, exist_ok=True)
+            with open(_CONFIG_FILE, "w") as f:
+                _json.dump(cls._data, f, indent=2)
+        except Exception:
+            pass
+
+
+# ── driver install thread ──────────────────────────────────────────────────────
+
+class DriverInstallThread(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)   # success, message
+
+    def run(self):
+        try:
+            self.progress.emit("Fetching latest release info…")
+            req = _url_req.Request(_UNITY_API,
+                                   headers={"User-Agent": "ProjectionPad/1.2"})
+            with _url_req.urlopen(req, timeout=20) as r:
+                release = _json.loads(r.read())
+
+            tag = release.get("tag_name", "")
+            dl_url = None
+            for a in release.get("assets", []):
+                if a.get("name", "").lower().endswith(".zip"):
+                    dl_url = a["browser_download_url"]
+                    break
+            if not dl_url:
+                dl_url = (f"https://github.com/schellingb/UnityCapture/"
+                          f"releases/download/{tag}/UnityCapture.zip")
+
+            self.progress.emit("Downloading driver (a few MB)…")
+            os.makedirs(_DRIVER_DIR, exist_ok=True)
+            zip_path = os.path.join(_DRIVER_DIR, "UnityCapture.zip")
+            _url_req.urlretrieve(dl_url, zip_path)
+
+            self.progress.emit("Extracting…")
+            dll_path = os.path.join(_DRIVER_DIR, _UNITY_DLL)
+            with _zipfile.ZipFile(zip_path, "r") as z:
+                target = None
+                for n in z.namelist():
+                    nl = n.lower()
+                    if nl.endswith(".dll") and ("x64" in nl or "64" in nl) and "filter" in nl:
+                        target = n
+                        break
+                if target is None:
+                    for n in z.namelist():
+                        if n.lower().endswith(".dll"):
+                            target = n
+                            break
+                if target is None:
+                    raise RuntimeError("No DLL found inside the downloaded archive.")
+                with z.open(target) as src, open(dll_path, "wb") as dst:
+                    dst.write(src.read())
+
+            self.progress.emit("Registering driver (you may see a UAC prompt)…")
+            # Try without elevation first (works if user is admin)
+            silent_ok = False
+            try:
+                r = subprocess.run(
+                    ["regsvr32", "/s", dll_path],
+                    capture_output=True, timeout=10)
+                silent_ok = (r.returncode == 0)
+            except Exception:
+                pass
+
+            if not silent_ok:
+                # Elevated via PowerShell RunAs — this shows a UAC prompt
+                subprocess.run([
+                    "powershell", "-NoProfile", "-Command",
+                    f'$p = Start-Process regsvr32 '
+                    f'-ArgumentList \'/s "{dll_path}"\' '
+                    f'-Verb RunAs -Wait -PassThru; exit $p.ExitCode'
+                ], timeout=90)
+
+            # Verify by trying pyvirtualcam
+            self.progress.emit("Verifying installation…")
+            time.sleep(1.5)
+            ok = self._verify()
+            if ok:
+                AppConfig.set("webcam_driver", "unity")
+                AppConfig.set("unity_dll", dll_path)
+                self.finished.emit(True, "")
+            else:
+                self.finished.emit(
+                    False,
+                    "Driver registered but couldn't be verified.\n\n"
+                    "Try restarting the application, or install OBS Studio manually.")
+
+        except Exception as ex:
+            self.finished.emit(False, f"Installation failed:\n\n{ex}")
+
+    @staticmethod
+    def _verify() -> bool:
+        if not HAS_PYVIRTUALCAM:
+            return False
+        try:
+            import pyvirtualcam as _pvc
+            with _pvc.Camera(2, 2, 1, fmt=_pvc.PixelFormat.RGB,
+                             backend="unitycapture", print_fps=False):
+                return True
+        except Exception:
+            return False
+
+
+# ── driver install dialog ──────────────────────────────────────────────────────
+
+class DriverInstallDialog(QDialog):
+    """Shows download/install progress for the built-in Unity Capture driver."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Installing Virtual Camera Driver")
+        self.setModal(True)
+        self.setFixedSize(440, 220)
+        self.setStyleSheet(_DLGSS)
+        self.success = False
+        self._thread: Optional[DriverInstallThread] = None
+        self._build()
+
+    def _build(self):
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(24, 24, 24, 24)
+        vl.setSpacing(10)
+
+        title = QLabel("Installing Virtual Camera Driver")
+        title.setStyleSheet(f"color:{C_TEXT};font-size:14px;font-weight:600;")
+        vl.addWidget(title)
+
+        note = QLabel(
+            "Downloading Unity Capture — a lightweight virtual camera driver.\n"
+            "Windows may show a UAC prompt to allow driver registration.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color:{C_DIM};font-size:11px;")
+        vl.addWidget(note)
+
+        self.status_lbl = QLabel("Starting…")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet(
+            f"color:{C_TEXT};font-size:12px;padding:6px 0;")
+        vl.addWidget(self.status_lbl)
+
+        vl.addStretch()
+
+        self.btn = QPushButton("Cancel")
+        self.btn.clicked.connect(self._cancel)
+        bl = QHBoxLayout()
+        bl.addStretch()
+        bl.addWidget(self.btn)
+        vl.addLayout(bl)
+
+        self._thread = DriverInstallThread()
+        self._thread.progress.connect(self.status_lbl.setText)
+        self._thread.finished.connect(self._on_finished)
+        self._thread.start()
+
+    def _cancel(self):
+        if self._thread and self._thread.isRunning():
+            self._thread.terminate()
+        self.reject()
+
+    def _on_finished(self, ok: bool, msg: str):
+        self.success = ok
+        if ok:
+            self.status_lbl.setText("Virtual camera driver installed successfully!")
+            self.btn.setText("OK — Start Webcam")
+            self.btn.setStyleSheet(
+                f"background:{C_ACTIVE};border:none;color:#FFFFFF;"
+                f"font-weight:600;border-radius:6px;padding:7px 18px;")
+            self.btn.clicked.disconnect()
+            self.btn.clicked.connect(self.accept)
+        else:
+            self.status_lbl.setText(f"Installation failed.\n{msg}")
+            self.btn.setText("Close")
+            self.btn.clicked.disconnect()
+            self.btn.clicked.connect(self.reject)
+
+    def closeEvent(self, event):
+        if self._thread and self._thread.isRunning():
+            self._thread.terminate()
+        super().closeEvent(event)
+
+
 # ── webcam setup dialog ────────────────────────────────────────────────────────
 
 class WebcamSetupDialog(QDialog):
@@ -870,43 +1097,48 @@ class WebcamSetupDialog(QDialog):
 
         intro = QLabel(
             "Webcam output (Pads 7 & 8) needs a virtual camera driver so that "
-            "apps like Zoom, Teams, and Google Meet can detect it as a camera input.")
+            "apps like Zoom, Teams, and Google Meet can detect it as a camera input.\n\n"
+            "The built-in driver (Unity Capture) is normally installed automatically "
+            "on first use. Use the options below if automatic install failed.")
         intro.setWordWrap(True)
         intro.setStyleSheet(f"color:{C_TEXT};font-size:12px;")
         vl.addWidget(intro)
 
-        # ── Option A: OBS Studio ──────────────────────────────────────────────
-        obs_grp = QGroupBox("Option A  —  OBS Studio  (recommended, free)")
-        obs_vl  = QVBoxLayout(obs_grp)
-        obs_desc = QLabel(
-            "Free open-source streaming app with a built-in virtual camera.\n"
-            "①  Install OBS Studio\n"
-            "②  Open OBS and click “Start Virtual Camera” in the Controls panel\n"
-            "③  Keep OBS running in the background — that’s it")
-        obs_desc.setWordWrap(True)
-        obs_desc.setStyleSheet(f"color:{C_DIM};font-size:11px;")
-        obs_btn = QPushButton("⬇  Download OBS Studio  —  obsproject.com")
-        obs_btn.setObjectName("OK")
-        obs_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(self.OBS_URL)))
-        obs_vl.addWidget(obs_desc)
-        obs_vl.addWidget(obs_btn)
-        vl.addWidget(obs_grp)
-
-        # ── Option B: Unity Capture ───────────────────────────────────────────
-        uc_grp = QGroupBox("Option B  —  Unity Capture  (lightweight driver)")
+        # ── Option A: Unity Capture (built-in) ────────────────────────────────
+        uc_grp = QGroupBox("Option A  —  Unity Capture  (built-in, recommended)")
         uc_vl  = QVBoxLayout(uc_grp)
         uc_desc = QLabel(
             "Small standalone driver — install once, no app needs to stay open.\n"
             "Virtual camera is always available after installation.")
         uc_desc.setWordWrap(True)
         uc_desc.setStyleSheet(f"color:{C_DIM};font-size:11px;")
-        uc_btn = QPushButton("⬇  Open Unity Capture on GitHub")
+        uc_install_btn = QPushButton("Install Built-in Driver Automatically")
+        uc_install_btn.setObjectName("OK")
+        uc_install_btn.clicked.connect(self._install_builtin)
+        uc_btn = QPushButton("⬇  Open Unity Capture on GitHub (manual)")
         uc_btn.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(self.UNITY_URL)))
         uc_vl.addWidget(uc_desc)
+        uc_vl.addWidget(uc_install_btn)
         uc_vl.addWidget(uc_btn)
         vl.addWidget(uc_grp)
+
+        # ── Option B: OBS Studio ──────────────────────────────────────────────
+        obs_grp = QGroupBox("Option B  —  OBS Studio  (alternative)")
+        obs_vl  = QVBoxLayout(obs_grp)
+        obs_desc = QLabel(
+            "Free open-source streaming app with a built-in virtual camera.\n"
+            "①  Install OBS Studio\n"
+            "②  Open OBS and click 'Start Virtual Camera' in the Controls panel\n"
+            "③  Keep OBS running in the background — that's it")
+        obs_desc.setWordWrap(True)
+        obs_desc.setStyleSheet(f"color:{C_DIM};font-size:11px;")
+        obs_btn = QPushButton("⬇  Download OBS Studio  —  obsproject.com")
+        obs_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(self.OBS_URL)))
+        obs_vl.addWidget(obs_desc)
+        obs_vl.addWidget(obs_btn)
+        vl.addWidget(obs_grp)
 
         # ── after-install note ────────────────────────────────────────────────
         note = QLabel(
@@ -920,6 +1152,15 @@ class WebcamSetupDialog(QDialog):
         btns.addStretch()
         btns.addWidget(close_btn)
         vl.addLayout(btns)
+
+    def _install_builtin(self):
+        self.accept()   # close setup dialog first
+        dlg = DriverInstallDialog(self.parent())
+        if dlg.exec_() == QDialog.Accepted and dlg.success:
+            # Signal the main window to retry the last webcam start
+            main = self.parent()
+            if hasattr(main, "_retry_last_webcam"):
+                main._retry_last_webcam()
 
 
 # ── configure dialog ───────────────────────────────────────────────────────────
@@ -1344,6 +1585,8 @@ class Main(QMainWindow):
         self.webcam_worker: Optional[WebcamThread]  = None
         self._proj_fps: int  = 60
         self._webcam_video_path: str = ""
+        self._last_webcam_pad: int = WEBCAM_PAD_SCREEN
+        AppConfig.load()
         self.setStyleSheet(_MAINSS)
         self._build()
         self._refresh()
@@ -1512,9 +1755,29 @@ class Main(QMainWindow):
                       "no camera registered" in msg.lower() or
                       "not installed" in msg.lower())
         if no_backend:
-            WebcamSetupDialog(self).exec_()
+            # Auto-install the built-in Unity Capture driver
+            reply = QMessageBox.question(
+                self, "Virtual Camera Driver Required",
+                "No virtual camera driver is installed.\n\n"
+                "Projection Pad can automatically download and install the built-in\n"
+                "driver (Unity Capture — small, no extra app required).\n\n"
+                "Windows may show a UAC prompt to allow driver registration.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if reply == QMessageBox.Yes:
+                dlg = DriverInstallDialog(self)
+                if dlg.exec_() == QDialog.Accepted and dlg.success:
+                    self._retry_last_webcam()
+            else:
+                WebcamSetupDialog(self).exec_()
         else:
             QMessageBox.critical(self, "Webcam Error", msg)
+
+    def _retry_last_webcam(self):
+        """Re-attempt the webcam pad that last failed (called after driver install)."""
+        if self._last_webcam_pad == WEBCAM_PAD_SCREEN:
+            self._start_webcam_screen()
+        else:
+            self._start_webcam_video()
 
     def _webcam_setup(self):
         WebcamSetupDialog(self).exec_()
@@ -1593,6 +1856,7 @@ class Main(QMainWindow):
         self.statusBar().showMessage("Projection stopped")
 
     def _start_webcam_screen(self):
+        self._last_webcam_pad = WEBCAM_PAD_SCREEN
         cfg = self.pads[WEBCAM_PAD_SCREEN]
         # If not configured, open source dialog first
         if cfg.stype == SourceType.EMPTY:
@@ -1615,6 +1879,7 @@ class Main(QMainWindow):
             f"Webcam output active (Pad 7) — {cfg.display_name}")
 
     def _start_webcam_video(self):
+        self._last_webcam_pad = WEBCAM_PAD_VIDEO
         # Toggle: if running, stop
         if self.webcam_worker and self.webcam_worker.isRunning():
             self._stop_webcam()
