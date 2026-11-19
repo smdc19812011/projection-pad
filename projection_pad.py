@@ -29,8 +29,9 @@ try:
         QGroupBox, QLineEdit, QDialogButtonBox, QShortcut,
         QFileDialog,
     )
-    from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize
-    from PyQt5.QtGui import QPixmap, QImage, QColor, QPainter, QFont, QPalette, QKeySequence
+    from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QUrl
+    from PyQt5.QtGui import (QPixmap, QImage, QColor, QPainter, QFont,
+                             QPalette, QKeySequence, QDesktopServices)
 except ImportError:
     sys.exit("PyQt5 required:  pip install PyQt5")
 
@@ -846,6 +847,81 @@ QPushButton#OK{{background:{C_ACCENT};border:none;color:#FFFFFF;font-weight:600}
 QPushButton#OK:hover{{background:#333333}}
 """
 
+# ── webcam setup dialog ────────────────────────────────────────────────────────
+
+class WebcamSetupDialog(QDialog):
+    """Explains virtual camera requirements and provides one-click download buttons."""
+
+    OBS_URL     = "https://obsproject.com/"
+    UNITY_URL   = "https://github.com/schellingb/UnityCapture"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Virtual Camera Setup")
+        self.setModal(True)
+        self.setFixedSize(500, 400)
+        self.setStyleSheet(_DLGSS)
+        self._build()
+
+    def _build(self):
+        vl = QVBoxLayout(self)
+        vl.setSpacing(12)
+        vl.setContentsMargins(20, 20, 20, 20)
+
+        intro = QLabel(
+            "Webcam output (Pads 7 & 8) needs a virtual camera driver so that "
+            "apps like Zoom, Teams, and Google Meet can detect it as a camera input.")
+        intro.setWordWrap(True)
+        intro.setStyleSheet(f"color:{C_TEXT};font-size:12px;")
+        vl.addWidget(intro)
+
+        # ── Option A: OBS Studio ──────────────────────────────────────────────
+        obs_grp = QGroupBox("Option A  —  OBS Studio  (recommended, free)")
+        obs_vl  = QVBoxLayout(obs_grp)
+        obs_desc = QLabel(
+            "Free open-source streaming app with a built-in virtual camera.\n"
+            "①  Install OBS Studio\n"
+            "②  Open OBS and click “Start Virtual Camera” in the Controls panel\n"
+            "③  Keep OBS running in the background — that’s it")
+        obs_desc.setWordWrap(True)
+        obs_desc.setStyleSheet(f"color:{C_DIM};font-size:11px;")
+        obs_btn = QPushButton("⬇  Download OBS Studio  —  obsproject.com")
+        obs_btn.setObjectName("OK")
+        obs_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(self.OBS_URL)))
+        obs_vl.addWidget(obs_desc)
+        obs_vl.addWidget(obs_btn)
+        vl.addWidget(obs_grp)
+
+        # ── Option B: Unity Capture ───────────────────────────────────────────
+        uc_grp = QGroupBox("Option B  —  Unity Capture  (lightweight driver)")
+        uc_vl  = QVBoxLayout(uc_grp)
+        uc_desc = QLabel(
+            "Small standalone driver — install once, no app needs to stay open.\n"
+            "Virtual camera is always available after installation.")
+        uc_desc.setWordWrap(True)
+        uc_desc.setStyleSheet(f"color:{C_DIM};font-size:11px;")
+        uc_btn = QPushButton("⬇  Open Unity Capture on GitHub")
+        uc_btn.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(self.UNITY_URL)))
+        uc_vl.addWidget(uc_desc)
+        uc_vl.addWidget(uc_btn)
+        vl.addWidget(uc_grp)
+
+        # ── after-install note ────────────────────────────────────────────────
+        note = QLabel(
+            "After installing, click the webcam pad again to start streaming.")
+        note.setStyleSheet(f"color:{C_DIM};font-size:10px;")
+        vl.addWidget(note)
+
+        btns = QHBoxLayout()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btns.addStretch()
+        btns.addWidget(close_btn)
+        vl.addLayout(btns)
+
+
 # ── configure dialog ───────────────────────────────────────────────────────────
 
 class ConfigDialog(QDialog):
@@ -1366,12 +1442,16 @@ class Main(QMainWindow):
         self.wcam_stop_btn.setEnabled(False)
         self.wcam_stop_btn.clicked.connect(self._stop_webcam)
 
+        wcam_setup_btn = QPushButton("Webcam Setup")
+        wcam_setup_btn.clicked.connect(self._webcam_setup)
+
         cl.addWidget(fps_lbl); cl.addWidget(self.fps_sl); cl.addWidget(self.fps_lbl2)
         cl.addStretch()
         self.disp_btn = QPushButton("Display")
         self.disp_btn.clicked.connect(self._display_settings)
         cl.addWidget(self.disp_btn)
         cl.addWidget(refresh_btn)
+        cl.addWidget(wcam_setup_btn)
         cl.addWidget(self.proj_btn)
         cl.addWidget(self.stop_btn)
         cl.addWidget(self.wcam_stop_btn)
@@ -1428,31 +1508,16 @@ class Main(QMainWindow):
 
     def _on_webcam_error(self, msg: str):
         self._stop_webcam()
-        # Friendly dialog for the common "no backend found" case
         no_backend = ("device not found" in msg.lower() or
                       "no camera registered" in msg.lower() or
                       "not installed" in msg.lower())
         if no_backend:
-            dlg = QMessageBox(self)
-            dlg.setWindowTitle("Virtual Camera Driver Not Found")
-            dlg.setIcon(QMessageBox.Warning)
-            dlg.setTextFormat(Qt.RichText)
-            dlg.setText(
-                "<b>No virtual camera driver is installed.</b><br><br>"
-                "Webcam output (Pads 7 &amp; 8) requires a virtual camera driver "
-                "so that apps like Zoom and Teams can detect it.<br><br>"
-                "<b>Option A — OBS Studio (recommended, free):</b><br>"
-                "&nbsp;&nbsp;1. Download from <i>obsproject.com</i><br>"
-                "&nbsp;&nbsp;2. Open OBS Studio<br>"
-                "&nbsp;&nbsp;3. Click <b>Start Virtual Camera</b> in the Controls panel<br>"
-                "&nbsp;&nbsp;4. Leave OBS open, then click the webcam pad again<br><br>"
-                "<b>Option B — Unity Capture (lightweight driver, no app needed):</b><br>"
-                "&nbsp;&nbsp;Search GitHub for <i>schellingb/UnityCapture</i> "
-                "and run the installer."
-            )
-            dlg.exec_()
+            WebcamSetupDialog(self).exec_()
         else:
             QMessageBox.critical(self, "Webcam Error", msg)
+
+    def _webcam_setup(self):
+        WebcamSetupDialog(self).exec_()
 
     def _pad_click(self, idx: int):
         if idx == WEBCAM_PAD_SCREEN:
