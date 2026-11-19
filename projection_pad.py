@@ -644,38 +644,40 @@ class PadWidget(QFrame):
         self._restyle()
 
     def _placeholder(self):
-        ph_h = PAD_H - 28
+        from PyQt5.QtCore import QRect
+        ph_h = PAD_H - 28   # 157 px
         pm = QPixmap(PAD_W, ph_h)
         pm.fill(QColor(C_KEY_BG))
         p = QPainter(pm)
 
         if self.cfg.index == WEBCAM_PAD_SCREEN:
-            # Orange icon area
+            # Symbol row  (y=14..54)
             p.setPen(QColor(C_WEBCAM))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 26))
-            icon_rect = pm.rect().adjusted(0, 8, 0, -40)
-            p.drawText(icon_rect, Qt.AlignHCenter | Qt.AlignVCenter, "CAM")
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 11, QFont.Bold))
-            mid_rect = pm.rect().adjusted(0, 50, 0, -20)
-            p.drawText(mid_rect, Qt.AlignHCenter | Qt.AlignTop, "SCREEN\nWEBCAM")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 22, QFont.Bold))
+            p.drawText(QRect(0, 14, PAD_W, 40), Qt.AlignCenter, "●")
+            # Label rows  (y=62..116)
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
+            p.drawText(QRect(0, 62, PAD_W, 26), Qt.AlignCenter, "SCREEN")
+            p.drawText(QRect(0, 90, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
+            # Hint row  (y=130..150)
             p.setPen(QColor(C_DIM_K))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(pm.rect().adjusted(4, 0, -4, -4),
-                       Qt.AlignHCenter | Qt.AlignBottom,
-                       "click to start  •  gear to set source")
+            p.drawText(QRect(4, 130, PAD_W - 8, 20), Qt.AlignCenter,
+                       "click to start  •  gear: set source")
 
         elif self.cfg.index == WEBCAM_PAD_VIDEO:
+            # Symbol row
             p.setPen(QColor(C_WEBCAM))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 26))
-            icon_rect = pm.rect().adjusted(0, 8, 0, -40)
-            p.drawText(icon_rect, Qt.AlignHCenter | Qt.AlignVCenter, "VID")
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 11, QFont.Bold))
-            mid_rect = pm.rect().adjusted(0, 50, 0, -20)
-            p.drawText(mid_rect, Qt.AlignHCenter | Qt.AlignTop, "VIDEO\nWEBCAM")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 22, QFont.Bold))
+            p.drawText(QRect(0, 14, PAD_W, 40), Qt.AlignCenter, "▶")
+            # Label rows
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
+            p.drawText(QRect(0, 62, PAD_W, 26), Qt.AlignCenter, "VIDEO")
+            p.drawText(QRect(0, 90, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
+            # Hint row
             p.setPen(QColor(C_DIM_K))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(pm.rect().adjusted(4, 0, -4, -4),
-                       Qt.AlignHCenter | Qt.AlignBottom,
+            p.drawText(QRect(4, 130, PAD_W - 8, 20), Qt.AlignCenter,
                        "click to select video file")
 
         else:
