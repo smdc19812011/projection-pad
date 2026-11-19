@@ -1428,7 +1428,31 @@ class Main(QMainWindow):
 
     def _on_webcam_error(self, msg: str):
         self._stop_webcam()
-        QMessageBox.critical(self, "Webcam Error", msg)
+        # Friendly dialog for the common "no backend found" case
+        no_backend = ("device not found" in msg.lower() or
+                      "no camera registered" in msg.lower() or
+                      "not installed" in msg.lower())
+        if no_backend:
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("Virtual Camera Driver Not Found")
+            dlg.setIcon(QMessageBox.Warning)
+            dlg.setTextFormat(Qt.RichText)
+            dlg.setText(
+                "<b>No virtual camera driver is installed.</b><br><br>"
+                "Webcam output (Pads 7 &amp; 8) requires a virtual camera driver "
+                "so that apps like Zoom and Teams can detect it.<br><br>"
+                "<b>Option A — OBS Studio (recommended, free):</b><br>"
+                "&nbsp;&nbsp;1. Download from <i>obsproject.com</i><br>"
+                "&nbsp;&nbsp;2. Open OBS Studio<br>"
+                "&nbsp;&nbsp;3. Click <b>Start Virtual Camera</b> in the Controls panel<br>"
+                "&nbsp;&nbsp;4. Leave OBS open, then click the webcam pad again<br><br>"
+                "<b>Option B — Unity Capture (lightweight driver, no app needed):</b><br>"
+                "&nbsp;&nbsp;Search GitHub for <i>schellingb/UnityCapture</i> "
+                "and run the installer."
+            )
+            dlg.exec_()
+        else:
+            QMessageBox.critical(self, "Webcam Error", msg)
 
     def _pad_click(self, idx: int):
         if idx == WEBCAM_PAD_SCREEN:
