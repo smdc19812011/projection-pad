@@ -1,6 +1,8 @@
 PyQt5>=5.15
 mss>=9.0
-# Optional for better image quality:
-# Pillow>=10.0
-# Windows only (window enumeration):
+# Windows only (window enumeration + display control):
 # pywin32>=306
+# Virtual webcam output (Pad 7 & 8) — requires OBS Studio on the target machine:
+# pyvirtualcam>=0.11.0
+# numpy>=1.24.0
+# opencv-python>=4.8.0

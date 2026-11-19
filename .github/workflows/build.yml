@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, master ]
     tags:     [ 'v*' ]
-  workflow_dispatch:        # lets you trigger manually from GitHub UI
+  workflow_dispatch:
 
 jobs:
   build-windows:
@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PyQt5 mss pywin32 pyinstaller
+          pip install PyQt5 mss pywin32 pyinstaller pyvirtualcam numpy opencv-python
 
       - name: Build exe
         run: |
@@ -36,7 +36,11 @@ jobs:
             --hidden-import=win32process `
             --hidden-import=win32api `
             --hidden-import=win32con `
+            --hidden-import=pyvirtualcam `
+            --hidden-import=numpy `
+            --hidden-import=cv2 `
             --collect-submodules=mss `
+            --collect-submodules=pyvirtualcam `
             projection_pad.py
 
       - name: Upload artifact
@@ -46,7 +50,6 @@ jobs:
           path: dist/ProjectionPad.exe
           retention-days: 30
 
-      # Also attach to a GitHub Release when you push a tag (e.g. v1.0)
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
