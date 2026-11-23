@@ -4354,12 +4354,37 @@ class VirtualScreenWindow(QMainWindow):
 
     def __init__(self, pad_number: int = 1):
         super().__init__()
+        # Explicit Qt.Window ensures a proper top-level OS window (no tool-window quirks)
+        self.setWindowFlags(Qt.Window |
+                            Qt.WindowTitleHint |
+                            Qt.WindowMinimizeButtonHint |
+                            Qt.WindowMaximizeButtonHint |
+                            Qt.WindowCloseButtonHint)
         self.setWindowTitle(f"Projection Pad — Meeting Screen {pad_number}")
         self._lbl = QLabel()
         self._lbl.setAlignment(Qt.AlignCenter)
         self._lbl.setStyleSheet("background:black;")
         self.setCentralWidget(self._lbl)
         self.resize(1280, 720)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # Strip WS_EX_TOOLWINDOW and force WS_EX_APPWINDOW so the window
+        # appears in Zoom/Teams "Share Window" picker and in Alt+Tab.
+        if PLATFORM == "Windows":
+            try:
+                import ctypes
+                hwnd            = int(self.winId())
+                GWL_EXSTYLE     = -20
+                WS_EX_APPWINDOW  = 0x00040000
+                WS_EX_TOOLWINDOW = 0x00000080
+                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+                # SWP_NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+                ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0037)
+            except Exception:
+                pass
 
     def push(self, px: QPixmap):
         sc = px.scaled(self._lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -4868,8 +4893,8 @@ class Main(QMainWindow):
         self.pad_widgets[idx].set_state(projected=True)
         self.virt_stop_all_btn.setEnabled(True)
         self.statusBar().showMessage(
-            f"Virtual screen {num} active — share "
-            f"'Projection Pad — Meeting Screen {num}' in Zoom/Teams")
+            f"Virtual screen {num} ready — in Zoom/Teams: Share Screen → "
+            f"Window tab → 'Projection Pad — Meeting Screen {num}'")
 
     def _stop_virtual_screen(self, idx: int):
         thr = self._virtual_threads.pop(idx, None)
