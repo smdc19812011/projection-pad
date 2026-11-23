@@ -3120,7 +3120,7 @@ class ProjectorThread(QThread):
 # ── webcam output thread ───────────────────────────────────────────────────────
 
 class WebcamThread(QThread):
-    """Outputs a video file as a virtual webcam via pyvirtualcam."""
+    """Outputs a video file or screen/window as a virtual webcam via pyvirtualcam."""
     frame_preview = pyqtSignal(int, QPixmap)
     error         = pyqtSignal(str)
     stopped       = pyqtSignal()
@@ -3130,17 +3130,33 @@ class WebcamThread(QThread):
         self._live        = False
         self._mu          = threading.Lock()
         self._video_path: str = ""
+        self._screen_cfg: Optional[PadConfig] = None
+        self._screens:    list = []
+        self._windows:    list = []
 
     def set_video_mode(self, path: str):
         with self._mu:
             self._video_path = path
+            self._screen_cfg = None
+
+    def set_screen_mode(self, cfg: "PadConfig", screens, windows):
+        with self._mu:
+            self._screen_cfg = cfg
+            self._screens    = list(screens)
+            self._windows    = list(windows)
+            self._video_path = ""
 
     def stop(self):
         self._live = False
 
     def run(self):
         self._live = True
-        self._run_video()
+        with self._mu:
+            is_screen = self._screen_cfg is not None
+        if is_screen:
+            self._run_screen()
+        else:
+            self._run_video()
         self.stopped.emit()
 
     def _run_video(self):
@@ -3210,6 +3226,56 @@ class WebcamThread(QThread):
                     audio_proc.terminate()
                 except Exception:
                     pass
+
+    def _run_screen(self):
+        if not HAS_PYVIRTUALCAM:
+            self.error.emit(
+                "pyvirtualcam not installed.\n\n"
+                "Install:  pip install pyvirtualcam\n\n"
+                "Also requires OBS Studio with OBS Virtual Camera enabled.")
+            return
+        if not HAS_CV2:
+            self.error.emit(
+                "opencv-python not installed.\n\n"
+                "Install:  pip install opencv-python")
+            return
+        with self._mu:
+            cfg     = self._screen_cfg
+            screens = self._screens[:]
+            windows = self._windows[:]
+        cam_w, cam_h = 1280, 720
+        fps = 30
+        _backend = AppConfig.get("webcam_driver", "")
+        _cam_kw = dict(width=cam_w, height=cam_h, fps=fps,
+                       fmt=pyvirtualcam.PixelFormat.RGB, print_fps=False)
+        if _backend == "unity":
+            _cam_kw["backend"] = "unitycapture"
+        prev_interval = max(1, fps // 5)
+        frame_num = 0
+        try:
+            import numpy as _np
+            with pyvirtualcam.Camera(**_cam_kw) as cam:
+                while self._live:
+                    px = Capture.for_pad(cfg, screens, windows)
+                    if px:
+                        qi = px.toImage().convertToFormat(QImage.Format_RGB888)
+                        bw, bh = qi.width(), qi.height()
+                        ptr = qi.bits()
+                        ptr.setsize(bh * bw * 3)
+                        frame_rgb = _np.frombuffer(ptr, _np.uint8).reshape(
+                            (bh, bw, 3)).copy()
+                        if frame_rgb.shape[1] != cam_w or frame_rgb.shape[0] != cam_h:
+                            frame_rgb = cv2.resize(frame_rgb, (cam_w, cam_h))
+                        cam.send(frame_rgb)
+                        frame_num += 1
+                        if frame_num % prev_interval == 0:
+                            qi2 = QImage(frame_rgb.tobytes(), cam_w, cam_h,
+                                         cam_w * 3, QImage.Format_RGB888)
+                            self.frame_preview.emit(WEBCAM_PAD_VIDEO,
+                                                    QPixmap.fromImage(qi2))
+                    cam.sleep_until_next_frame()
+        except Exception as ex:
+            self.error.emit(f"Screen webcam error:\n{ex}")
 
 # ── pad widget ─────────────────────────────────────────────────────────────────
 
@@ -3307,19 +3373,19 @@ class PadWidget(QFrame):
                        "click to project Pads 1–4")
 
         elif self.cfg.index == WEBCAM_PAD_VIDEO:
-            # Symbol row
+            # Symbol row: play + screen icons side by side
             p.setPen(QColor(C_WEBCAM))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 22, QFont.Bold))
-            p.drawText(QRect(0, 14, PAD_W, 40), Qt.AlignCenter, "▶")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 18, QFont.Bold))
+            p.drawText(QRect(0, 12, PAD_W, 36), Qt.AlignCenter, "▶  🖥")
             # Label rows
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
-            p.drawText(QRect(0, 62, PAD_W, 26), Qt.AlignCenter, "VIDEO")
-            p.drawText(QRect(0, 90, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
+            p.drawText(QRect(0, 60, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
+            p.drawText(QRect(0, 86, PAD_W, 26), Qt.AlignCenter, "OUTPUT")
             # Hint row
             p.setPen(QColor(C_DIM_K))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(QRect(4, 130, PAD_W - 8, 20), Qt.AlignCenter,
-                       "click to select video file")
+            p.drawText(QRect(4, 125, PAD_W - 8, 22), Qt.AlignCenter,
+                       "video or screen / window")
 
         else:
             p.setPen(QColor(C_DIM_K))
@@ -3863,6 +3929,63 @@ class ConfigDialog(QDialog):
         self.accept()
 
 # ── video webcam config dialog ─────────────────────────────────────────────────
+
+class WebcamSourceDialog(QDialog):
+    """Picker: choose video file or screen/window for Pad 8 webcam output."""
+    VIDEO  = 1
+    SCREEN = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.choice = 0
+        self.setWindowTitle("Webcam Source — Pad 8")
+        self.setModal(True)
+        self.setFixedSize(360, 170)
+        self.setStyleSheet(_DLGSS)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(16)
+
+        lbl = QLabel("Choose webcam source for Pad 8:")
+        lbl.setStyleSheet("font-weight:bold;font-size:11px;")
+        lay.addWidget(lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(12)
+
+        btn_v = QPushButton("▶   Video File")
+        btn_v.setFixedHeight(44)
+        btn_v.setStyleSheet(
+            f"QPushButton{{background:{C_WEBCAM};color:#000;"
+            f"border:none;border-radius:7px;font-weight:bold;font-size:11px;}}"
+            f"QPushButton:hover{{background:#FFB340;}}")
+        btn_v.clicked.connect(lambda: self._pick(self.VIDEO))
+
+        btn_s = QPushButton("🖥   Screen / Window")
+        btn_s.setFixedHeight(44)
+        btn_s.setStyleSheet(
+            f"QPushButton{{background:#2A2A2E;color:{C_TEXT};"
+            f"border:1px solid #444;border-radius:7px;"
+            f"font-weight:bold;font-size:11px;}}"
+            f"QPushButton:hover{{border-color:#888;}}")
+        btn_s.clicked.connect(lambda: self._pick(self.SCREEN))
+
+        btn_row.addWidget(btn_v)
+        btn_row.addWidget(btn_s)
+        lay.addLayout(btn_row)
+
+        cancel = QPushButton("Cancel")
+        cancel.setFixedHeight(28)
+        cancel.setStyleSheet(
+            "QPushButton{background:transparent;color:#888;border:none;font-size:10px;}"
+            "QPushButton:hover{color:#ccc;}")
+        cancel.clicked.connect(self.reject)
+        lay.addWidget(cancel, alignment=Qt.AlignCenter)
+
+    def _pick(self, choice: int):
+        self.choice = choice
+        self.accept()
+
 
 class VideoWebcamConfigDialog(QDialog):
     def __init__(self, current_path: str = "", parent=None):
@@ -4500,18 +4623,32 @@ class Main(QMainWindow):
 
     def _start_webcam_video(self):
         self._last_webcam_pad = WEBCAM_PAD_VIDEO
-        # Toggle: if THIS pad is already running, stop it
+        # Toggle: if already running, stop it
         if (self.webcam_worker and self.webcam_worker.isRunning()
                 and self._webcam_active_pad == WEBCAM_PAD_VIDEO):
             self._stop_webcam()
             return
-        dlg = VideoWebcamConfigDialog(self._webcam_video_path, self)
-        if dlg.exec_() != QDialog.Accepted:
+        # Let user pick video file or screen/window
+        picker = WebcamSourceDialog(self)
+        if picker.exec_() != QDialog.Accepted:
             return
-        self._webcam_video_path = dlg.path
+        worker = WebcamThread()
+        if picker.choice == WebcamSourceDialog.VIDEO:
+            dlg = VideoWebcamConfigDialog(self._webcam_video_path, self)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+            self._webcam_video_path = dlg.path
+            worker.set_video_mode(self._webcam_video_path)
+            status_detail = os.path.basename(self._webcam_video_path)
+        else:
+            cfg = self.pads[WEBCAM_PAD_VIDEO]
+            dlg = ConfigDialog(cfg, self.windows, self.screens, self)
+            if dlg.exec_() != QDialog.Accepted or cfg.stype == SourceType.EMPTY:
+                return
+            worker.set_screen_mode(cfg, self.screens, self.windows)
+            status_detail = cfg.display_name
         self._stop_webcam()
-        self.webcam_worker = WebcamThread()
-        self.webcam_worker.set_video_mode(self._webcam_video_path)
+        self.webcam_worker = worker
         self.webcam_worker.frame_preview.connect(self._on_webcam_frame)
         self.webcam_worker.error.connect(self._on_webcam_error)
         self.webcam_worker.stopped.connect(self._stop_webcam)
@@ -4519,8 +4656,7 @@ class Main(QMainWindow):
         self._webcam_active_pad = WEBCAM_PAD_VIDEO
         self.pad_widgets[WEBCAM_PAD_VIDEO].set_state(webcam=True)
         self.wcam_stop_btn.setEnabled(True)
-        fname = os.path.basename(self._webcam_video_path)
-        self.statusBar().showMessage(f"Video webcam active (Pad 8) — {fname}")
+        self.statusBar().showMessage(f"Webcam output active (Pad 8) — {status_detail}")
 
     def _stop_webcam(self):
         if self.webcam_worker:
@@ -4537,14 +4673,22 @@ class Main(QMainWindow):
     def _configure(self, idx: int):
         cfg = self.pads[idx]
         if idx == WEBCAM_PAD_VIDEO:
-            dlg = VideoWebcamConfigDialog(self._webcam_video_path, self)
-            if dlg.exec_() == QDialog.Accepted:
-                self._webcam_video_path = dlg.path
-                cfg.stype = SourceType.VIDEO
-                cfg.sname = os.path.basename(dlg.path)
-                self.pad_widgets[idx].update_cfg(cfg)
-                self.statusBar().showMessage(
-                    f"Pad 8 video configured: {cfg.sname}")
+            picker = WebcamSourceDialog(self)
+            if picker.exec_() != QDialog.Accepted:
+                return
+            if picker.choice == WebcamSourceDialog.VIDEO:
+                dlg = VideoWebcamConfigDialog(self._webcam_video_path, self)
+                if dlg.exec_() == QDialog.Accepted:
+                    self._webcam_video_path = dlg.path
+                    cfg.stype = SourceType.VIDEO
+                    cfg.sname = os.path.basename(dlg.path)
+                    self.pad_widgets[idx].update_cfg(cfg)
+                    self.statusBar().showMessage(f"Pad 8 configured: {cfg.sname}")
+            else:
+                dlg = ConfigDialog(cfg, self.windows, self.screens, self)
+                if dlg.exec_() == QDialog.Accepted and cfg.stype != SourceType.EMPTY:
+                    self.pad_widgets[idx].update_cfg(cfg)
+                    self.statusBar().showMessage(f"Pad 8 configured: {cfg.sname}")
             return
         dlg = ConfigDialog(cfg, self.windows, self.screens, self)
         if dlg.exec_() == QDialog.Accepted:
