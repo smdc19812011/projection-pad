@@ -101,8 +101,10 @@ C_TEXT_K   = "#F5F5F7"
 C_DIM_K    = "#555558"
 C_WEBCAM   = "#FF9F0A"   # Elgato signature orange
 C_QUAD     = "#0A84FF"   # Apple blue — quad-project accent
+C_VIRTUAL  = "#30D158"   # Apple green — meeting virtual screen
 
 # Special pad indices (zero-based)
+VIRTUAL_PAD       = 5   # Pad 6 — meeting virtual screen share
 QUAD_PAD          = 6   # projects Pads 1-4 as a 2×2 grid
 WEBCAM_PAD_VIDEO  = 7   # video file → virtual webcam
 
@@ -3122,6 +3124,44 @@ class ProjectorThread(QThread):
         painter.end()
         return QPixmap.fromImage(result) if any_frame else None
 
+# ── virtual screen thread ──────────────────────────────────────────────────────
+
+class VirtualScreenThread(QThread):
+    """Captures a configured source and feeds VirtualScreenWindow at ~30 fps."""
+    frame   = pyqtSignal(QPixmap)
+    stopped = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._live    = False
+        self._mu      = threading.Lock()
+        self._cfg:     Optional[PadConfig] = None
+        self._screens: list = []
+        self._windows: list = []
+
+    def set_source(self, cfg: "PadConfig", screens, windows):
+        with self._mu:
+            self._cfg     = cfg
+            self._screens = list(screens)
+            self._windows = list(windows)
+
+    def stop(self):
+        self._live = False
+
+    def run(self):
+        self._live = True
+        while self._live:
+            t0 = time.time()
+            with self._mu:
+                cfg, ss, ws = self._cfg, self._screens[:], self._windows[:]
+            if cfg and cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
+                px = Capture.for_pad(cfg, ss, ws)
+                if px:
+                    self.frame.emit(px)
+            elapsed = time.time() - t0
+            time.sleep(max(0.0, 1.0 / 30 - elapsed))
+        self.stopped.emit()
+
 # ── webcam output thread ───────────────────────────────────────────────────────
 
 class WebcamThread(QThread):
@@ -3321,7 +3361,9 @@ class PadWidget(QFrame):
         self.dot.setObjectName("Dot")
         self.dot.setFixedWidth(10)
 
-        self.name = QLabel(self.cfg.display_name)
+        _footer_name = ("Meeting Screen Share"
+                        if self.cfg.index == VIRTUAL_PAD else self.cfg.display_name)
+        self.name = QLabel(_footer_name)
         self.name.setObjectName("Name")
 
         self.sc_lbl = QLabel(f"Ctrl+{self.cfg.index + 1}")
@@ -3354,7 +3396,28 @@ class PadWidget(QFrame):
         pm.fill(QColor(C_KEY_BG))
         p = QPainter(pm)
 
-        if self.cfg.index == QUAD_PAD:
+        if self.cfg.index == VIRTUAL_PAD:
+            # Monitor icon
+            p.setPen(QColor(C_VIRTUAL))
+            p.setBrush(Qt.NoBrush)
+            # Simple monitor outline
+            mx, my, mw, mh = (PAD_W - 54) // 2, 14, 54, 36
+            p.drawRoundedRect(mx, my, mw, mh, 3, 3)
+            p.drawLine(PAD_W // 2, my + mh, PAD_W // 2, my + mh + 7)
+            p.drawLine(PAD_W // 2 - 10, my + mh + 7, PAD_W // 2 + 10, my + mh + 7)
+            # Labels
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 9, QFont.Bold))
+            p.drawText(QRect(0, 68, PAD_W, 20), Qt.AlignCenter, "MEETING")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 7, QFont.Bold))
+            p.drawText(QRect(0, 86, PAD_W, 18), Qt.AlignCenter, "VIRTUAL SCREEN")
+            p.drawText(QRect(0, 102, PAD_W, 18), Qt.AlignCenter, "SHARE")
+            # Hint
+            p.setPen(QColor(C_DIM_K))
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 7))
+            p.drawText(QRect(4, 128, PAD_W - 8, 20), Qt.AlignCenter,
+                       "share in Zoom / Teams")
+
+        elif self.cfg.index == QUAD_PAD:
             # 2×2 grid icon
             p.setPen(QColor(C_QUAD))
             p.setBrush(QColor(C_QUAD + "33"))
@@ -3414,6 +3477,8 @@ class PadWidget(QFrame):
         self._restyle()
         if webcam:
             dot_color = C_WEBCAM
+        elif projected and self.cfg.index == VIRTUAL_PAD:
+            dot_color = C_VIRTUAL
         elif projected:
             dot_color = C_ACTIVE
         elif selected:
@@ -3427,22 +3492,29 @@ class PadWidget(QFrame):
 
     def update_cfg(self, cfg: PadConfig):
         self.cfg = cfg
-        self.name.setText(cfg.display_name)
+        if cfg.index == VIRTUAL_PAD and cfg.stype == SourceType.EMPTY:
+            self.name.setText("Meeting Screen Share")
+        else:
+            self.name.setText(cfg.display_name)
         if cfg.stype in (SourceType.EMPTY, SourceType.VIDEO):
             self._placeholder()
         self._restyle()
 
     def _restyle(self):
-        is_quad   = self.cfg.index == QUAD_PAD
-        is_webcam = self.cfg.index == WEBCAM_PAD_VIDEO
+        is_virtual = self.cfg.index == VIRTUAL_PAD
+        is_quad    = self.cfg.index == QUAD_PAD
+        is_webcam  = self.cfg.index == WEBCAM_PAD_VIDEO
         if self._webcam_live:
             border = f"2px solid {C_WEBCAM}"
         elif self._projected:
-            border = f"2px solid {C_QUAD if is_quad else C_ACTIVE}"
+            border = (f"2px solid {C_VIRTUAL}" if is_virtual else
+                      f"2px solid {C_QUAD}" if is_quad else f"2px solid {C_ACTIVE}")
         elif self._selected:
             border = "2px solid #FFFFFF"
         elif self.cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
-            border = f"1px solid {C_ACTIVE}44"
+            border = f"1px solid {C_VIRTUAL}44" if is_virtual else f"1px solid {C_ACTIVE}44"
+        elif is_virtual:
+            border = f"1px solid {C_VIRTUAL}44"
         elif is_quad:
             border = f"1px solid {C_QUAD}44"
         elif is_webcam:
@@ -3450,7 +3522,9 @@ class PadWidget(QFrame):
         else:
             border = "1px solid #2E2E2E"
 
-        hover_border = C_QUAD if is_quad else (C_WEBCAM if is_webcam else "#FFFFFF")
+        hover_border = (C_VIRTUAL if is_virtual else
+                        C_QUAD if is_quad else
+                        C_WEBCAM if is_webcam else "#FFFFFF")
 
         self.setStyleSheet(f"""
 QFrame#Pad{{
@@ -3500,8 +3574,17 @@ QLabel#ShortcutLbl{{
             f"QMenu::item{{padding:6px 20px;border-radius:3px}}"
             f"QMenu::item:selected{{background:#2D2D2D}}"
         )
-        is_quad   = self.cfg.index == QUAD_PAD
-        is_webcam = self.cfg.index == WEBCAM_PAD_VIDEO
+        is_virtual = self.cfg.index == VIRTUAL_PAD
+        is_quad    = self.cfg.index == QUAD_PAD
+        is_webcam  = self.cfg.index == WEBCAM_PAD_VIDEO
+        if is_virtual:
+            a1 = m.addAction("MON  Project Virtual Screen")
+            a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
+            m.addSeparator()
+            a2 = m.addAction("CONF  Configure Source...")
+            a2.triggered.connect(lambda: self.configure.emit(self.cfg.index))
+            m.exec_(e.globalPos())
+            return
         if is_quad:
             a1 = m.addAction("GRID  Quad Project (Pads 1–4)")
             a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
@@ -4258,6 +4341,34 @@ class Projector(QMainWindow):
             self.hide()
         super().keyPressEvent(e)
 
+# ── meeting virtual screen window ──────────────────────────────────────────────
+
+class VirtualScreenWindow(QMainWindow):
+    """Shareable window for meeting screen share — detectable by Zoom/Teams."""
+    closed = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Projection Pad — Meeting Screen Share")
+        self._lbl = QLabel()
+        self._lbl.setAlignment(Qt.AlignCenter)
+        self._lbl.setStyleSheet("background:black;")
+        self.setCentralWidget(self._lbl)
+        self.resize(1280, 720)
+
+    def push(self, px: QPixmap):
+        sc = px.scaled(self._lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._lbl.setPixmap(sc)
+
+    def closeEvent(self, e):
+        self.closed.emit()
+        super().closeEvent(e)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Escape:
+            self.hide()
+        super().keyPressEvent(e)
+
 # ── main window stylesheet ─────────────────────────────────────────────────────
 
 _MAINSS = f"""
@@ -4283,6 +4394,16 @@ QPushButton#WebcamStop{{
   background:{C_WEBCAM};border:none;color:#1C1C1E;font-weight:600
 }}
 QPushButton#WebcamStop:hover{{background:#E08800}}
+QPushButton#VirtProj{{
+  background:{C_VIRTUAL};border:none;color:#000000;font-weight:600
+}}
+QPushButton#VirtProj:hover{{background:#34E05A}}
+QPushButton#VirtProj:disabled{{background:#2A2A2A;color:#555}}
+QPushButton#VirtStop{{
+  background:#1E3A26;border:1px solid {C_VIRTUAL};color:{C_VIRTUAL};font-weight:600
+}}
+QPushButton#VirtStop:hover{{background:#1A4A2A}}
+QPushButton#VirtStop:disabled{{border-color:#333;color:#555}}
 #Header{{background:{C_SURFACE};border-bottom:1px solid {C_BORDER}}}
 #Controls{{background:{C_SURFACE};border-top:1px solid {C_BORDER}}}
 QSlider::groove:horizontal{{
@@ -4308,9 +4429,12 @@ class Main(QMainWindow):
         self.projector: Optional[Projector] = None
         self.screens: List[ScreenInfo]    = []
         self.windows: List[WinInfo]       = []
-        self.worker:       Optional[CaptureThread]  = None
-        self.proj_worker:  Optional[ProjectorThread] = None
-        self.webcam_worker: Optional[WebcamThread]  = None
+        self.worker:          Optional[CaptureThread]       = None
+        self.proj_worker:     Optional[ProjectorThread]     = None
+        self.webcam_worker:   Optional[WebcamThread]        = None
+        self._virtual_window: Optional[VirtualScreenWindow] = None
+        self._virtual_thread: Optional[VirtualScreenThread] = None
+        self._virtual_active: bool = False
         self._proj_fps: int  = 60
         self._webcam_video_path: str = ""
         self._last_webcam_pad: int             = WEBCAM_PAD_VIDEO
@@ -4382,10 +4506,13 @@ class Main(QMainWindow):
         QShortcut(QKeySequence("Ctrl+D"),
                   self).activated.connect(self._display_settings)
 
-        # Controls bar
-        ctrl = QWidget(); ctrl.setObjectName("Controls"); ctrl.setFixedHeight(56)
-        cl   = QHBoxLayout(ctrl)
-        cl.setContentsMargins(20, 10, 20, 10); cl.setSpacing(10)
+        # Controls bar — two rows
+        ctrl = QWidget(); ctrl.setObjectName("Controls"); ctrl.setFixedHeight(96)
+        cl   = QVBoxLayout(ctrl)
+        cl.setContentsMargins(20, 8, 20, 8); cl.setSpacing(6)
+
+        # Row 1: preview fps + display/projection controls
+        row1 = QHBoxLayout(); row1.setSpacing(10)
 
         fps_lbl = QLabel("Preview:")
         fps_lbl.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
@@ -4418,16 +4545,40 @@ class Main(QMainWindow):
         wcam_setup_btn = QPushButton("Webcam Setup")
         wcam_setup_btn.clicked.connect(self._webcam_setup)
 
-        cl.addWidget(fps_lbl); cl.addWidget(self.fps_sl); cl.addWidget(self.fps_lbl2)
-        cl.addStretch()
+        row1.addWidget(fps_lbl); row1.addWidget(self.fps_sl); row1.addWidget(self.fps_lbl2)
+        row1.addStretch()
         self.disp_btn = QPushButton("Display")
         self.disp_btn.clicked.connect(self._display_settings)
-        cl.addWidget(self.disp_btn)
-        cl.addWidget(refresh_btn)
-        cl.addWidget(wcam_setup_btn)
-        cl.addWidget(self.proj_btn)
-        cl.addWidget(self.stop_btn)
-        cl.addWidget(self.wcam_stop_btn)
+        row1.addWidget(self.disp_btn)
+        row1.addWidget(refresh_btn)
+        row1.addWidget(wcam_setup_btn)
+        row1.addWidget(self.proj_btn)
+        row1.addWidget(self.stop_btn)
+        row1.addWidget(self.wcam_stop_btn)
+
+        # Row 2: virtual screen controls
+        row2 = QHBoxLayout(); row2.setSpacing(10)
+
+        virt_lbl = QLabel("Meeting Virtual Screen:")
+        virt_lbl.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
+
+        self.virt_proj_btn = QPushButton("Project Virtual Screen")
+        self.virt_proj_btn.setObjectName("VirtProj")
+        self.virt_proj_btn.setEnabled(False)
+        self.virt_proj_btn.clicked.connect(self._start_virtual_screen)
+
+        self.virt_stop_btn = QPushButton("Stop Projecting Virtual Screen")
+        self.virt_stop_btn.setObjectName("VirtStop")
+        self.virt_stop_btn.setEnabled(False)
+        self.virt_stop_btn.clicked.connect(self._stop_virtual_screen)
+
+        row2.addWidget(virt_lbl)
+        row2.addWidget(self.virt_proj_btn)
+        row2.addWidget(self.virt_stop_btn)
+        row2.addStretch()
+
+        cl.addLayout(row1)
+        cl.addLayout(row2)
         vl.addWidget(ctrl)
 
         self.statusBar().showMessage(
@@ -4446,6 +4597,9 @@ class Main(QMainWindow):
         self.windows = Bridge.windows()
         if self.worker:
             self.worker.set_sources(self.screens, self.windows)
+        if self._virtual_thread and self._virtual_thread.isRunning():
+            self._virtual_thread.set_source(
+                self.pads[VIRTUAL_PAD], self.screens, self.windows)
         ext = Bridge.external_screen()
         if ext:
             qt_screens = QApplication.screens()
@@ -4510,6 +4664,14 @@ class Main(QMainWindow):
         WebcamSetupDialog(self).exec_()
 
     def _pad_click(self, idx: int):
+        if idx == VIRTUAL_PAD:
+            if self._virtual_active:
+                self._stop_virtual_screen()
+            elif self.pads[VIRTUAL_PAD].stype != SourceType.EMPTY:
+                self._start_virtual_screen()
+            else:
+                self._configure(VIRTUAL_PAD)
+            return
         if idx == QUAD_PAD:
             self._start_quad_projection()
             return
@@ -4626,6 +4788,55 @@ class Main(QMainWindow):
         self.statusBar().showMessage(
             f"Quad projecting Pads 1–4  {self._proj_fps} fps")
 
+    def _start_virtual_screen(self):
+        cfg = self.pads[VIRTUAL_PAD]
+        if cfg.stype == SourceType.EMPTY:
+            self._configure(VIRTUAL_PAD)
+            if cfg.stype == SourceType.EMPTY:
+                return
+        # Stop any existing virtual screen
+        self._stop_virtual_screen()
+        # Create window
+        self._virtual_window = VirtualScreenWindow()
+        self._virtual_window.closed.connect(self._stop_virtual_screen)
+        self._virtual_window.show()
+        # Start capture thread
+        self._virtual_thread = VirtualScreenThread()
+        self._virtual_thread.set_source(cfg, self.screens, self.windows)
+        self._virtual_thread.frame.connect(self._on_virtual_frame)
+        self._virtual_thread.stopped.connect(self._stop_virtual_screen)
+        self._virtual_thread.start()
+        self._virtual_active = True
+        self.pad_widgets[VIRTUAL_PAD].set_state(projected=True)
+        self.virt_proj_btn.setEnabled(False)
+        self.virt_stop_btn.setEnabled(True)
+        self.statusBar().showMessage(
+            f"Virtual screen active — share 'Projection Pad — Meeting Screen Share' in Zoom/Teams")
+
+    def _stop_virtual_screen(self):
+        if self._virtual_thread:
+            self._virtual_thread.stopped.disconnect()
+            self._virtual_thread.stop()
+            self._virtual_thread.wait(2000)
+            self._virtual_thread = None
+        if self._virtual_window:
+            self._virtual_window.closed.disconnect()
+            self._virtual_window.close()
+            self._virtual_window = None
+        self._virtual_active = False
+        cfg = self.pads[VIRTUAL_PAD]
+        self.pad_widgets[VIRTUAL_PAD].set_state(projected=False)
+        if cfg.stype == SourceType.EMPTY:
+            self.pad_widgets[VIRTUAL_PAD]._placeholder()
+        self.virt_proj_btn.setEnabled(cfg.stype != SourceType.EMPTY)
+        self.virt_stop_btn.setEnabled(False)
+        self.statusBar().showMessage("Virtual screen stopped")
+
+    def _on_virtual_frame(self, px: QPixmap):
+        if self._virtual_window and self._virtual_window.isVisible():
+            self._virtual_window.push(px)
+        self.pad_widgets[VIRTUAL_PAD].set_frame(px)
+
     def _start_webcam_video(self):
         self._last_webcam_pad = WEBCAM_PAD_VIDEO
         # Toggle: if already running, stop it
@@ -4677,6 +4888,14 @@ class Main(QMainWindow):
 
     def _configure(self, idx: int):
         cfg = self.pads[idx]
+        if idx == VIRTUAL_PAD:
+            dlg = ConfigDialog(cfg, self.windows, self.screens, self)
+            if dlg.exec_() == QDialog.Accepted and cfg.stype != SourceType.EMPTY:
+                self.pad_widgets[idx].update_cfg(cfg)
+                self.virt_proj_btn.setEnabled(True)
+                self.statusBar().showMessage(
+                    f"Pad 6 (Meeting Virtual Screen) configured: {cfg.sname}")
+            return
         if idx == WEBCAM_PAD_VIDEO:
             picker = WebcamSourceDialog(self)
             if picker.exec_() != QDialog.Accepted:
@@ -4738,12 +4957,14 @@ class Main(QMainWindow):
         self._refresh()
 
     def closeEvent(self, e):
-        for w in (self.webcam_worker, self.proj_worker, self.worker):
+        for w in (self._virtual_thread, self.webcam_worker, self.proj_worker, self.worker):
             if w:
                 w.stop()
-        for w in (self.webcam_worker, self.proj_worker, self.worker):
+        for w in (self._virtual_thread, self.webcam_worker, self.proj_worker, self.worker):
             if w:
                 w.wait(2000)
+        if self._virtual_window:
+            self._virtual_window.close()
         if self.projector:
             self.projector.close()
         super().closeEvent(e)
