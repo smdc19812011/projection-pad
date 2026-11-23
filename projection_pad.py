@@ -4354,6 +4354,7 @@ class VirtualScreenWindow(QMainWindow):
 
     def __init__(self, pad_number: int = 1):
         super().__init__()
+        self._pad_number = pad_number
         # Explicit Qt.Window ensures a proper top-level OS window (no tool-window quirks)
         self.setWindowFlags(Qt.Window |
                             Qt.WindowTitleHint |
@@ -4361,32 +4362,59 @@ class VirtualScreenWindow(QMainWindow):
                             Qt.WindowMaximizeButtonHint |
                             Qt.WindowCloseButtonHint)
         self.setWindowTitle(f"Projection Pad — Meeting Screen {pad_number}")
+        # Idle overlay shown until a source frame arrives
+        self._idle = QLabel(
+            f"Projection Pad\nMeeting Screen {pad_number}\n\n"
+            "Waiting for source…\n\n"
+            "In Zoom: Share Screen → Window → select this window")
+        self._idle.setAlignment(Qt.AlignCenter)
+        self._idle.setStyleSheet(
+            "background:#111;color:#555;font-size:14px;padding:20px;")
         self._lbl = QLabel()
         self._lbl.setAlignment(Qt.AlignCenter)
         self._lbl.setStyleSheet("background:black;")
-        self.setCentralWidget(self._lbl)
+        self._lbl.hide()
+        from PyQt5.QtWidgets import QStackedWidget
+        stack = QStackedWidget()
+        stack.addWidget(self._idle)   # index 0
+        stack.addWidget(self._lbl)    # index 1
+        self._stack = stack
+        self.setCentralWidget(stack)
         self.resize(1280, 720)
 
     def showEvent(self, e):
         super().showEvent(e)
-        # Strip WS_EX_TOOLWINDOW and force WS_EX_APPWINDOW so the window
-        # appears in Zoom/Teams "Share Window" picker and in Alt+Tab.
+        # Defer the Win32 fix: showEvent fires before the HWND is fully
+        # registered with the shell, so the style change must wait until
+        # the event loop has processed the WM_SHOWWINDOW message.
         if PLATFORM == "Windows":
-            try:
-                import ctypes
-                hwnd            = int(self.winId())
-                GWL_EXSTYLE     = -20
-                WS_EX_APPWINDOW  = 0x00040000
-                WS_EX_TOOLWINDOW = 0x00000080
-                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-                style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
-                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            QTimer.singleShot(300, self._fix_win32_style)
+
+    def _fix_win32_style(self):
+        """Remove WS_EX_TOOLWINDOW / add WS_EX_APPWINDOW.
+        Without this Qt windows are invisible in Zoom/Teams Share → Window."""
+        if PLATFORM != "Windows":
+            return
+        try:
+            import ctypes
+            hwnd = int(self.winId())
+            if not hwnd:
+                return
+            GWL_EXSTYLE      = -20
+            WS_EX_APPWINDOW  = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            cur = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            new = (cur | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+            if new != cur:
+                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
                 # SWP_NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
                 ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0037)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def push(self, px: QPixmap):
+        if self._stack.currentIndex() == 0:
+            self._stack.setCurrentIndex(1)
         sc = px.scaled(self._lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._lbl.setPixmap(sc)
 
@@ -4893,8 +4921,8 @@ class Main(QMainWindow):
         self.pad_widgets[idx].set_state(projected=True)
         self.virt_stop_all_btn.setEnabled(True)
         self.statusBar().showMessage(
-            f"Virtual screen {num} ready — in Zoom/Teams: Share Screen → "
-            f"Window tab → 'Projection Pad — Meeting Screen {num}'")
+            f"Virtual screen {num} open — in Zoom: Share Screen → "
+            f"Advanced → 'Window' — select 'Projection Pad — Meeting Screen {num}'")
 
     def _stop_virtual_screen(self, idx: int):
         thr = self._virtual_threads.pop(idx, None)
