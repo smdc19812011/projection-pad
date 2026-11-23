@@ -100,10 +100,11 @@ C_KEY_FT   = "#111111"
 C_TEXT_K   = "#F5F5F7"
 C_DIM_K    = "#555558"
 C_WEBCAM   = "#FF9F0A"   # Elgato signature orange
+C_QUAD     = "#0A84FF"   # Apple blue — quad-project accent
 
-# Webcam pad indices (zero-based)
-WEBCAM_PAD_SCREEN = 6
-WEBCAM_PAD_VIDEO  = 7
+# Special pad indices (zero-based)
+QUAD_PAD          = 6   # projects Pads 1-4 as a 2×2 grid
+WEBCAM_PAD_VIDEO  = 7   # video file → virtual webcam
 
 # ── driver / config paths ──────────────────────────────────────────────────────
 
@@ -3014,7 +3015,7 @@ class CaptureThread(QThread):
                 if cfg.stype in (SourceType.EMPTY, SourceType.VIDEO):
                     continue
                 # WebcamThread handles previews for webcam pads
-                if cfg.index in (WEBCAM_PAD_SCREEN, WEBCAM_PAD_VIDEO):
+                if cfg.index in (QUAD_PAD, WEBCAM_PAD_VIDEO):
                     continue
                 px = Capture.for_pad(cfg, ss, ws)
                 if px:
@@ -3029,9 +3030,11 @@ class ProjectorThread(QThread):
 
     def __init__(self):
         super().__init__()
-        self._cfg: Optional[PadConfig] = None
-        self._screens: List[ScreenInfo] = []
-        self._windows: List[WinInfo]    = []
+        self._cfg: Optional[PadConfig]   = None
+        self._quad_pads: List[PadConfig] = []
+        self._quad_mode: bool            = False
+        self._screens: List[ScreenInfo]  = []
+        self._windows: List[WinInfo]     = []
         self._fps    = 60
         self._live   = False
         self._mu     = threading.Lock()
@@ -3039,9 +3042,19 @@ class ProjectorThread(QThread):
     def set_target(self, cfg: PadConfig, screens: List[ScreenInfo],
                    windows: List[WinInfo]):
         with self._mu:
-            self._cfg     = cfg
-            self._screens = screens[:]
-            self._windows = windows[:]
+            self._cfg        = cfg
+            self._quad_mode  = False
+            self._screens    = screens[:]
+            self._windows    = windows[:]
+
+    def set_quad_mode(self, pads: List["PadConfig"], screens: List[ScreenInfo],
+                      windows: List[WinInfo]):
+        with self._mu:
+            self._quad_pads  = pads[:4]
+            self._quad_mode  = True
+            self._cfg        = None
+            self._screens    = screens[:]
+            self._windows    = windows[:]
 
     def update_sources(self, screens: List[ScreenInfo], windows: List[WinInfo]):
         with self._mu:
@@ -3059,43 +3072,67 @@ class ProjectorThread(QThread):
         while self._live:
             t0 = time.time()
             with self._mu:
-                cfg, ss, ws = self._cfg, self._screens[:], self._windows[:]
-            if cfg and cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
+                quad, cfg, pads = self._quad_mode, self._cfg, self._quad_pads[:]
+                ss, ws = self._screens[:], self._windows[:]
+            if quad:
+                composite = self._compose_quad(pads, ss, ws)
+                if composite:
+                    self.frame.emit(composite)
+            elif cfg and cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
                 px = Capture.for_pad(cfg, ss, ws)
                 if px:
                     self.frame.emit(px)
             dt = time.time() - t0
             time.sleep(max(0.0, 1.0 / self._fps - dt))
 
+    @staticmethod
+    def _compose_quad(pads: List["PadConfig"], ss: list, ws: list) -> Optional[QPixmap]:
+        W, H = 1920, 1080
+        hw, hh = W // 2, H // 2
+        result = QImage(W, H, QImage.Format_ARGB32)
+        result.fill(Qt.black)
+        painter = QPainter(result)
+        positions = [(0, 0), (hw, 0), (0, hh), (hw, hh)]
+        any_frame = False
+        for pad, (ox, oy) in zip(pads, positions):
+            if pad.stype == SourceType.EMPTY:
+                continue
+            px = Capture.for_pad(pad, ss, ws)
+            if not px:
+                continue
+            any_frame = True
+            scaled = px.scaled(hw - 4, hh - 4,
+                               Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = ox + (hw - scaled.width()) // 2
+            y = oy + (hh - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+            # Pad number badge
+            painter.setPen(QColor(C_QUAD))
+            painter.setFont(QFont("Segoe UI,Inter,sans-serif", 11, QFont.Bold))
+            painter.drawText(ox + 8, oy + hh - 8, f"Pad {pad.index + 1}")
+        # Divider lines
+        painter.setPen(QColor("#333333"))
+        painter.drawLine(hw, 0, hw, H)
+        painter.drawLine(0, hh, W, hh)
+        painter.end()
+        return QPixmap.fromImage(result) if any_frame else None
+
 # ── webcam output thread ───────────────────────────────────────────────────────
 
 class WebcamThread(QThread):
-    """Outputs a screen/window or video file as a virtual webcam via pyvirtualcam + OBS."""
+    """Outputs a video file as a virtual webcam via pyvirtualcam."""
     frame_preview = pyqtSignal(int, QPixmap)
     error         = pyqtSignal(str)
     stopped       = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self._live   = False
-        self._mu     = threading.Lock()
-        self._mode: str = "screen"
-        self._screen_cfg: Optional[PadConfig] = None
-        self._screens: List[ScreenInfo] = []
-        self._windows: List[WinInfo]    = []
+        self._live        = False
+        self._mu          = threading.Lock()
         self._video_path: str = ""
-
-    def set_screen_mode(self, cfg: PadConfig, screens: List[ScreenInfo],
-                        windows: List[WinInfo]):
-        with self._mu:
-            self._mode       = "screen"
-            self._screen_cfg = cfg
-            self._screens    = screens[:]
-            self._windows    = windows[:]
 
     def set_video_mode(self, path: str):
         with self._mu:
-            self._mode       = "video"
             self._video_path = path
 
     def stop(self):
@@ -3103,66 +3140,8 @@ class WebcamThread(QThread):
 
     def run(self):
         self._live = True
-        if self._mode == "screen":
-            self._run_screen()
-        else:
-            self._run_video()
+        self._run_video()
         self.stopped.emit()
-
-    def _run_screen(self):
-        if not HAS_PYVIRTUALCAM:
-            self.error.emit(
-                "pyvirtualcam not installed.\n\n"
-                "Install:  pip install pyvirtualcam\n\n"
-                "Also requires OBS Studio with OBS Virtual Camera enabled.")
-            return
-        with self._mu:
-            cfg, ss, ws = self._screen_cfg, self._screens[:], self._windows[:]
-        if cfg is None:
-            return
-        px = Capture.for_pad(cfg, ss, ws)
-        if not px:
-            self.error.emit("Could not capture source for webcam output.")
-            return
-        cam_w = max((px.width()  // 2) * 2, 640)
-        cam_h = max((px.height() // 2) * 2, 480)
-        _backend = AppConfig.get("webcam_driver", "")
-        _cam_kw: dict = dict(width=cam_w, height=cam_h, fps=30,
-                             fmt=pyvirtualcam.PixelFormat.RGB, print_fps=False)
-        if _backend == "unity":
-            _cam_kw["backend"] = "unitycapture"
-        try:
-            with pyvirtualcam.Camera(**_cam_kw) as cam:
-                _prev_tick = 0
-                while self._live:
-                    with self._mu:
-                        cfg2, ss2, ws2 = (self._screen_cfg,
-                                          self._screens[:], self._windows[:])
-                    px2 = Capture.for_pad(cfg2, ss2, ws2) if cfg2 else None
-                    if px2 and HAS_NUMPY:
-                        scaled  = px2.scaled(cam_w, cam_h,
-                                             Qt.KeepAspectRatioByExpanding,
-                                             Qt.SmoothTransformation)
-                        cropped = scaled.copy(0, 0, cam_w, cam_h)
-                        img = cropped.toImage().convertToFormat(QImage.Format_RGB888)
-                        ptr = img.bits()
-                        ptr.setsize(cam_h * cam_w * 3)
-                        arr = np.frombuffer(ptr, dtype=np.uint8).reshape(
-                            (cam_h, cam_w, 3)).copy()
-                        cam.send(arr)
-                        cam.sleep_until_next_frame()
-                        tick = int(time.time() * 5)
-                        if tick != _prev_tick:
-                            _prev_tick = tick
-                            self.frame_preview.emit(WEBCAM_PAD_SCREEN, cropped)
-                    else:
-                        time.sleep(1.0 / 30)
-        except Exception as ex:
-            _bk = AppConfig.get("webcam_driver", "")
-            _hint = ("Check that the Unity Capture driver is registered (Pad 7 → Install Driver)."
-                     if _bk == "unity"
-                     else "Ensure OBS Studio is installed and OBS Virtual Camera is active.")
-            self.error.emit(f"Virtual camera error:\n{ex}\n\n{_hint}")
 
     def _run_video(self):
         if not HAS_PYVIRTUALCAM:
@@ -3304,20 +3283,28 @@ class PadWidget(QFrame):
         pm.fill(QColor(C_KEY_BG))
         p = QPainter(pm)
 
-        if self.cfg.index == WEBCAM_PAD_SCREEN:
-            # Symbol row  (y=14..54)
-            p.setPen(QColor(C_WEBCAM))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 22, QFont.Bold))
-            p.drawText(QRect(0, 14, PAD_W, 40), Qt.AlignCenter, "●")
-            # Label rows  (y=62..116)
+        if self.cfg.index == QUAD_PAD:
+            # 2×2 grid icon
+            p.setPen(QColor(C_QUAD))
+            p.setBrush(QColor(C_QUAD + "33"))
+            cell = 18
+            gap  = 4
+            gw   = cell * 2 + gap
+            sx   = (PAD_W - gw) // 2
+            sy   = 18
+            for r in range(2):
+                for c in range(2):
+                    p.drawRect(sx + c * (cell + gap), sy + r * (cell + gap), cell, cell)
+            p.setBrush(Qt.NoBrush)
+            # Labels
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
-            p.drawText(QRect(0, 62, PAD_W, 26), Qt.AlignCenter, "SCREEN")
-            p.drawText(QRect(0, 90, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
-            # Hint row  (y=130..150)
+            p.drawText(QRect(0, 72, PAD_W, 26), Qt.AlignCenter, "QUAD")
+            p.drawText(QRect(0, 96, PAD_W, 22), Qt.AlignCenter, "PROJECT")
+            # Hint
             p.setPen(QColor(C_DIM_K))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
             p.drawText(QRect(4, 130, PAD_W - 8, 20), Qt.AlignCenter,
-                       "click to start  •  gear: set source")
+                       "click to project Pads 1–4")
 
         elif self.cfg.index == WEBCAM_PAD_VIDEO:
             # Symbol row
@@ -3375,21 +3362,24 @@ class PadWidget(QFrame):
         self._restyle()
 
     def _restyle(self):
-        is_webcam = self.cfg.index in (WEBCAM_PAD_SCREEN, WEBCAM_PAD_VIDEO)
+        is_quad   = self.cfg.index == QUAD_PAD
+        is_webcam = self.cfg.index == WEBCAM_PAD_VIDEO
         if self._webcam_live:
             border = f"2px solid {C_WEBCAM}"
         elif self._projected:
-            border = f"2px solid {C_ACTIVE}"
+            border = f"2px solid {C_QUAD if is_quad else C_ACTIVE}"
         elif self._selected:
             border = "2px solid #FFFFFF"
         elif self.cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
             border = f"1px solid {C_ACTIVE}44"
+        elif is_quad:
+            border = f"1px solid {C_QUAD}44"
         elif is_webcam:
             border = f"1px solid {C_WEBCAM}44"
         else:
             border = "1px solid #2E2E2E"
 
-        hover_border = C_WEBCAM if is_webcam else "#FFFFFF"
+        hover_border = C_QUAD if is_quad else (C_WEBCAM if is_webcam else "#FFFFFF")
 
         self.setStyleSheet(f"""
 QFrame#Pad{{
@@ -3439,7 +3429,13 @@ QLabel#ShortcutLbl{{
             f"QMenu::item{{padding:6px 20px;border-radius:3px}}"
             f"QMenu::item:selected{{background:#2D2D2D}}"
         )
-        is_webcam = self.cfg.index in (WEBCAM_PAD_SCREEN, WEBCAM_PAD_VIDEO)
+        is_quad   = self.cfg.index == QUAD_PAD
+        is_webcam = self.cfg.index == WEBCAM_PAD_VIDEO
+        if is_quad:
+            a1 = m.addAction("GRID  Quad Project (Pads 1–4)")
+            a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
+            m.exec_(e.globalPos())
+            return
         if is_webcam:
             label = "CAM  Start Webcam Output"
             a1 = m.addAction(label)
@@ -4189,8 +4185,9 @@ class Main(QMainWindow):
         self.webcam_worker: Optional[WebcamThread]  = None
         self._proj_fps: int  = 60
         self._webcam_video_path: str = ""
-        self._last_webcam_pad: int   = WEBCAM_PAD_SCREEN
+        self._last_webcam_pad: int             = WEBCAM_PAD_VIDEO
         self._webcam_active_pad: Optional[int] = None
+        self._quad_projecting: bool            = False
         AppConfig.load()
         self.setStyleSheet(_MAINSS)
         self._build()
@@ -4379,17 +4376,14 @@ class Main(QMainWindow):
 
     def _retry_last_webcam(self):
         """Re-attempt the webcam pad that last failed (called after driver install)."""
-        if self._last_webcam_pad == WEBCAM_PAD_SCREEN:
-            self._start_webcam_screen()
-        else:
-            self._start_webcam_video()
+        self._start_webcam_video()
 
     def _webcam_setup(self):
         WebcamSetupDialog(self).exec_()
 
     def _pad_click(self, idx: int):
-        if idx == WEBCAM_PAD_SCREEN:
-            self._start_webcam_screen()
+        if idx == QUAD_PAD:
+            self._start_quad_projection()
             return
         if idx == WEBCAM_PAD_VIDEO:
             self._start_webcam_video()
@@ -4453,6 +4447,7 @@ class Main(QMainWindow):
             self.proj_worker = None
         if self.projector:
             self.projector.hide()
+        self._quad_projecting = False
         for i, cfg in enumerate(self.pads):
             cfg.projected = False
             self.pad_widgets[i].set_state(selected=(i == self.selected))
@@ -4460,31 +4455,48 @@ class Main(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.statusBar().showMessage("Projection stopped")
 
-    def _start_webcam_screen(self):
-        self._last_webcam_pad = WEBCAM_PAD_SCREEN
-        cfg = self.pads[WEBCAM_PAD_SCREEN]
-        # If not configured, open source dialog first
-        if cfg.stype == SourceType.EMPTY:
-            self._configure(WEBCAM_PAD_SCREEN)
-            if cfg.stype == SourceType.EMPTY:
-                return
-        # Toggle: if THIS pad is already running, stop it
-        if (self.webcam_worker and self.webcam_worker.isRunning()
-                and self._webcam_active_pad == WEBCAM_PAD_SCREEN):
-            self._stop_webcam()
+    def _start_quad_projection(self):
+        # Toggle: if already quad-projecting, stop
+        if self._quad_projecting:
+            self._stop()
             return
-        self._stop_webcam()
-        self.webcam_worker = WebcamThread()
-        self.webcam_worker.set_screen_mode(cfg, self.screens, self.windows)
-        self.webcam_worker.frame_preview.connect(self._on_webcam_frame)
-        self.webcam_worker.error.connect(self._on_webcam_error)
-        self.webcam_worker.stopped.connect(self._stop_webcam)
-        self.webcam_worker.start()
-        self._webcam_active_pad = WEBCAM_PAD_SCREEN
-        self.pad_widgets[WEBCAM_PAD_SCREEN].set_state(webcam=True)
-        self.wcam_stop_btn.setEnabled(True)
+        # Collect the first 4 configured pads (indices 0-3)
+        quad_pads = [self.pads[i] for i in range(4)]
+        if all(p.stype == SourceType.EMPTY for p in quad_pads):
+            QMessageBox.information(
+                self, "No Sources",
+                "Configure at least one of Pads 1–4 before using Quad Project.")
+            return
+        ext = Bridge.external_screen()
+        if not ext and len(self.screens) < 2:
+            r = QMessageBox.question(
+                self, "No External Display",
+                "No external display detected.\n\n"
+                "Connect an HDMI/display and click Refresh,\n"
+                "or project to this screen for a preview?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if r == QMessageBox.No:
+                return
+            ext = self.screens[0] if self.screens else None
+        # Stop any existing single projection
+        self._stop()
+        self._quad_projecting = True
+        if self.projector is None:
+            self.projector = Projector()
+        self.projector.place(ext)
+        self.projector.showFullScreen()
+        if self.proj_worker is None:
+            self.proj_worker = ProjectorThread()
+            self.proj_worker.frame.connect(self._on_proj_frame)
+        self.proj_worker.set_quad_mode(quad_pads, self.screens, self.windows)
+        self.proj_worker.set_fps(self._proj_fps)
+        if not self.proj_worker.isRunning():
+            self.proj_worker.start()
+        self.pad_widgets[QUAD_PAD].set_state(projected=True)
+        self.stop_btn.setEnabled(True)
+        self.proj_btn.setText("Projecting...")
         self.statusBar().showMessage(
-            f"Webcam output active (Pad 7) — {cfg.display_name}")
+            f"Quad projecting Pads 1–4  {self._proj_fps} fps")
 
     def _start_webcam_video(self):
         self._last_webcam_pad = WEBCAM_PAD_VIDEO
@@ -4517,9 +4529,7 @@ class Main(QMainWindow):
             self.webcam_worker.wait(2000)
             self.webcam_worker = None
         self._webcam_active_pad = None
-        self.pad_widgets[WEBCAM_PAD_SCREEN].set_state(webcam=False)
         self.pad_widgets[WEBCAM_PAD_VIDEO].set_state(webcam=False)
-        self.pad_widgets[WEBCAM_PAD_SCREEN]._placeholder()
         self.pad_widgets[WEBCAM_PAD_VIDEO]._placeholder()
         self.wcam_stop_btn.setEnabled(False)
         self.statusBar().showMessage("Webcam output stopped")
@@ -4565,7 +4575,11 @@ class Main(QMainWindow):
             self._refresh()
 
     def _on_proj_frame(self, px: QPixmap):
-        if self.projector and self.projector.isVisible() and self.selected is not None:
+        if not (self.projector and self.projector.isVisible()):
+            return
+        if self._quad_projecting:
+            self.projector.push(px, "Quad View — Pads 1–4")
+        elif self.selected is not None:
             self.projector.push(px, self.pads[self.selected].display_name)
 
     def _display_settings(self):
