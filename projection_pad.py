@@ -2928,9 +2928,8 @@ class Capture:
             if not win32gui.IsWindow(hwnd):
                 return None
             placement = win32gui.GetWindowPlacement(hwnd)
-            was_minimised = (placement[1] == win32con.SW_SHOWMINIMIZED)
-            if was_minimised:
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            if placement[1] == win32con.SW_SHOWMINIMIZED:
+                return None  # minimized — caller returns None to hold last frame
             rect = win32gui.GetWindowRect(hwnd)
             w = rect[2] - rect[0]
             h = rect[3] - rect[1]
@@ -2949,8 +2948,6 @@ class Capture:
             mem_dc.DeleteDC()
             mfc_dc.DeleteDC()
             win32gui.ReleaseDC(hwnd, hwnd_dc)
-            if was_minimised:
-                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
             qi = QImage(data, info['bmWidth'], info['bmHeight'], QImage.Format_ARGB32)
             return QPixmap.fromImage(qi)
         except Exception:
@@ -2971,6 +2968,14 @@ class Capture:
             except StopIteration:
                 return None
             if PLATFORM == "Windows" and HAS_WIN32:
+                try:
+                    hwnd = int(win.id)
+                    if win32gui.IsWindow(hwnd):
+                        placement = win32gui.GetWindowPlacement(hwnd)
+                        if placement[1] == win32con.SW_SHOWMINIMIZED:
+                            return None  # hold last projected frame; don't capture minimized
+                except Exception:
+                    pass
                 px = cls.grab_window_win32(win.id)
                 if px:
                     return px
