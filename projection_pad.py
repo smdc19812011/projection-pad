@@ -3000,22 +3000,56 @@ class Capture:
         except Exception:
             return None
 
+    @staticmethod
+    def _is_window_minimized_win32(hwnd: int) -> bool:
+        try:
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return True
+            if ctypes.windll.user32.IsIconic(hwnd):
+                return True
+            placement = win32gui.GetWindowPlacement(hwnd)
+            if placement[1] == win32con.SW_SHOWMINIMIZED:
+                return True
+            # Check DWM cloaked state (e.g. UWP / virtual desktop hidden windows)
+            try:
+                cloaked = ctypes.c_int(0)
+                ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if cloaked.value != 0:
+                    return True
+            except Exception:
+                pass
+            rect = win32gui.GetWindowRect(hwnd)
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+            if rect[0] <= -30000 or rect[1] <= -30000 or w < 80 or h < 80:
+                return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _is_blank_image(qi: QImage) -> bool:
+        """Return True if an 8x8 sample grid across qi is all pure black."""
+        w, h = qi.width(), qi.height()
+        if w <= 0 or h <= 0:
+            return True
+        for iy in range(1, 9):
+            y = (h * iy) // 9
+            for ix in range(1, 9):
+                x = (w * ix) // 9
+                px = qi.pixel(x, y)
+                if (px & 0x00FFFFFF) != 0:
+                    return False
+        return True
+
     @classmethod
     def grab_window_win32(cls, hwnd_str: str) -> Optional[QPixmap]:
         if not HAS_WIN32:
             return None
         try:
             hwnd = int(hwnd_str)
-            if not win32gui.IsWindow(hwnd):
-                return None
-            # IsIconic fires at the START of the minimize animation;
-            # GetWindowPlacement only updates after it finishes (~200 ms later).
-            # Checking IsIconic first prevents PrintWindow capturing a black frame
-            # during the animation.
-            if ctypes.windll.user32.IsIconic(hwnd):
-                return None
-            placement = win32gui.GetWindowPlacement(hwnd)
-            if placement[1] == win32con.SW_SHOWMINIMIZED:
+            if cls._is_window_minimized_win32(hwnd):
                 return None
             rect = win32gui.GetWindowRect(hwnd)
             w = rect[2] - rect[0]
@@ -3028,14 +3062,21 @@ class Capture:
             bmp      = win32ui.CreateBitmap()
             bmp.CreateCompatibleBitmap(mfc_dc, w, h)
             mem_dc.SelectObject(bmp)
-            ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), 2)
+            ok = ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), 2)
+            if not ok:
+                ok = ctypes.windll.user32.PrintWindow(hwnd, mem_dc.GetSafeHdc(), 0)
             info = bmp.GetInfo()
             data = bmp.GetBitmapBits(True)
             win32gui.DeleteObject(bmp.GetHandle())
             mem_dc.DeleteDC()
             mfc_dc.DeleteDC()
             win32gui.ReleaseDC(hwnd, hwnd_dc)
+            if not ok:
+                return None
             qi = QImage(data, info['bmWidth'], info['bmHeight'], QImage.Format_ARGB32)
+            # Re-check minimize state after PrintWindow (catches race during animation)
+            if cls._is_window_minimized_win32(hwnd) or cls._is_blank_image(qi):
+                return None
             return QPixmap.fromImage(qi)
         except Exception:
             return None
@@ -3055,19 +3096,7 @@ class Capture:
             except StopIteration:
                 return None
             if PLATFORM == "Windows" and HAS_WIN32:
-                try:
-                    hwnd = int(win.id)
-                    if win32gui.IsWindow(hwnd):
-                        if ctypes.windll.user32.IsIconic(hwnd):
-                            return None  # animate-to-minimize started; hold last frame
-                        placement = win32gui.GetWindowPlacement(hwnd)
-                        if placement[1] == win32con.SW_SHOWMINIMIZED:
-                            return None
-                except Exception:
-                    pass
-                px = cls.grab_window_win32(win.id)
-                if px:
-                    return px
+                return cls.grab_window_win32(win.id)
             if win.bounds:
                 return cls.grab(*win.bounds)
         return None
