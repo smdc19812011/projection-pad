@@ -3025,6 +3025,86 @@ class Bridge:
         return False
 
     @staticmethod
+    def ensure_extend_mode():
+        """Switch Windows display mode to Extend so all connected monitors turn on."""
+        if PLATFORM != "Windows":
+            return
+        try:
+            subprocess.Popen(
+                ["DisplaySwitch.exe", "/extend"],
+                creationflags=0x08000000,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def move_windows_to_primary(exclude_hwnds: Optional[set] = None):
+        """Move visible app windows from secondary monitors onto the primary monitor."""
+        if PLATFORM != "Windows" or not HAS_WIN32:
+            return
+        primary = QApplication.primaryScreen()
+        if not primary:
+            return
+        pg = primary.availableGeometry()
+        px, py, pw, ph = pg.x(), pg.y(), pg.width(), pg.height()
+        skip_classes = {
+            "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+            "Progman", "WorkerW", "Windows.UI.Core.CoreWindow",
+        }
+        excl = exclude_hwnds or set()
+
+        def cb(hwnd, _):
+            if hwnd in excl:
+                return True
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if ctypes.windll.user32.IsIconic(hwnd):
+                return True
+            if not win32gui.GetWindowText(hwnd):
+                return True
+            try:
+                cls = win32gui.GetClassName(hwnd)
+                if cls in skip_classes:
+                    return True
+                cloaked = ctypes.c_int(0)
+                ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                    hwnd, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if cloaked.value != 0:
+                    return True
+            except Exception:
+                pass
+            try:
+                r = win32gui.GetWindowRect(hwnd)
+                w, h = r[2] - r[0], r[3] - r[1]
+                if w <= 50 or h <= 50 or r[0] <= -30000:
+                    return True
+                cx, cy = r[0] + w // 2, r[1] + h // 2
+                # Already on primary monitor
+                if px <= cx < px + pw and py <= cy < py + ph:
+                    return True
+                placement = win32gui.GetWindowPlacement(hwnd)
+                was_max = (placement[1] == win32con.SW_SHOWMAXIMIZED)
+                if was_max:
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                nw = min(w, pw - 40)
+                nh = min(h, ph - 40)
+                nx = px + max(0, (pw - nw) // 2)
+                ny = py + max(0, (ph - nh) // 2)
+                win32gui.SetWindowPos(
+                    hwnd, 0, nx, ny, nw, nh,
+                    win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE)
+                if was_max:
+                    win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumWindows(cb, None)
+        except Exception:
+            pass
+
+    @staticmethod
     def cameras(max_probe: int = 6) -> List[int]:
         """Probe available physical camera indices via OpenCV."""
         if not HAS_CV2:
@@ -3726,7 +3806,7 @@ class PadWidget(QFrame):
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setObjectName("Preview")
         self.preview.setMinimumHeight(96)
-        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self._placeholder()
 
         footer = QWidget()
@@ -5692,6 +5772,9 @@ class Main(QMainWindow):
 
     def _project_to_targets(self, pad_idx: int, targets: List[ScreenInfo],
                             quad_pads: Optional[List[PadConfig]] = None):
+        excl = {int(p.winId()) for p in self.projectors.values()}
+        Bridge.move_windows_to_primary(excl)
+
         pad_cfg = self.pads[pad_idx]
         if (quad_pads is None and pad_cfg.stype == SourceType.TAB
                 and pad_cfg.sid and "|" in pad_cfg.sid):
@@ -5763,9 +5846,19 @@ class Main(QMainWindow):
             return None
         return dlg.chosen
 
+    def _ensure_extended_before_project(self):
+        if PLATFORM == "Windows":
+            had_ext = len(QApplication.screens()) >= 2
+            Bridge.ensure_extend_mode()
+            if not had_ext:
+                time.sleep(1.2)
+                QApplication.processEvents()
+                self._refresh()
+
     def _project(self):
         if self.selected is None:
             return
+        self._ensure_extended_before_project()
         targets = self._resolve_targets(self.pads[self.selected])
         if not targets:
             return
@@ -5798,6 +5891,7 @@ class Main(QMainWindow):
                 self, "No Sources",
                 "Configure at least one of Pads 1–4 before using Quad Project.")
             return
+        self._ensure_extended_before_project()
         targets = self._resolve_targets(self.pads[QUAD_PAD])
         if not targets:
             return
@@ -5992,17 +6086,13 @@ class Main(QMainWindow):
     def _init_display(self):
         if PLATFORM != "Windows":
             return
-        if len(QApplication.screens()) < 2:
-            try:
-                subprocess.Popen(
-                    ["DisplaySwitch.exe", "/extend"],
-                    creationflags=0x08000000,
-                )
-            except Exception:
-                pass
-            QTimer.singleShot(1500, self._refresh)
-        else:
-            self._refresh()
+        Bridge.ensure_extend_mode()
+        QTimer.singleShot(1500, self._after_extend_init)
+
+    def _after_extend_init(self):
+        self._refresh()
+        excl = {int(p.winId()) for p in self.projectors.values()}
+        Bridge.move_windows_to_primary(excl)
 
     def _on_proj_frame(self, screen_idx: int, px: QPixmap):
         pad_idx = self._screen_pad.get(screen_idx)

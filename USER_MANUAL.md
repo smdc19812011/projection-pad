@@ -88,6 +88,7 @@ Streams a **Video File** (with audio via `ffplay`) or a **Screen / Window** to a
 
 Projection Pad detects all connected displays (`Display 2`, `Display 3`, `Display 4`, etc.):
 
+- **Automatic Extend Mode & Window Safety (Windows):** On app launch and when pressing **Project**, Projection Pad automatically switches Windows to **Extend** mode (`DisplaySwitch.exe /extend`) so all connected monitors turn on, and moves any open application windows from secondary monitors onto the primary monitor so they aren't hidden behind the projector.
 - **Global Output:** Use the **Output:** dropdown in the top toolbar to pick a specific external monitor or **All External**.
 - **Per-Pad Output Routing:**
   - Set **Output Monitor** inside `Configure Pad` (Pads 1–4) or `Media Source` (Pad 5), or right-click any pad (Pads 1–5 & Quad Pad 7) → **Output Monitor ▸**.
