@@ -121,4 +121,7 @@ Projection Pad detects all connected displays (`Display 2`, `Display 3`, `Displa
   pip install PyQt5 mss pywin32 pyvirtualcam numpy opencv-python uiautomation
   python projection_pad.py
   ```
-- **Windows `.exe`:** Every push to `main` automatically builds `ProjectionPad.exe` via GitHub Actions (**Actions → latest build → Artifacts → ProjectionPad-Windows**).
+- **Pre-built binaries (Windows, macOS, Linux):** Every push to `main` automatically builds all three platforms via GitHub Actions (**Actions → latest build → Artifacts**):
+  - `ProjectionPad-Windows` (`ProjectionPad.exe`)
+  - `ProjectionPad-macOS` (`ProjectionPad-macOS.zip` containing `ProjectionPad.app`)
+  - `ProjectionPad-Linux` (`ProjectionPad-Linux.tar.gz` containing `ProjectionPad`; requires `wmctrl` or `xdotool` for window listing)
