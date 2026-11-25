@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
 Projection Pad  v1.2
-Virtual screen manager — up to 8 pads, each showing a window or display.
-Pads 1–6: click to select, then 'Project' to send fullscreen to HDMI.
-Pad 7:    screen/window → virtual webcam output (Unity Capture driver built-in).
-Pad 8:    video file    → virtual webcam output with audio.
+Virtual screen manager — up to 8 pads, each showing a window, display, or media.
+Pads 1–4: click to select, then 'Project' to send fullscreen to HDMI.
+Pad 5:    image or video selection to show on the projected screen.
+Pad 6:    webcam/camera input (ON/OFF) shown as lower-right PIP on projected screen.
+Pad 7:    Quad Project (2×2 live composite of Pads 1–4).
+Pad 8:    video file or screen/window → virtual webcam output.
 
 Requirements: pip install PyQt5 mss
 Optional:     pip install pywin32 pyvirtualcam numpy opencv-python (Windows)
@@ -27,11 +29,11 @@ try:
         QMenu, QAction, QDialog, QComboBox, QMessageBox,
         QToolButton, QSlider, QListWidget, QListWidgetItem,
         QGroupBox, QLineEdit, QDialogButtonBox, QShortcut,
-        QFileDialog, QButtonGroup, QRadioButton,
+        QFileDialog, QButtonGroup, QRadioButton, QCheckBox,
     )
     from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QUrl
-    from PyQt5.QtGui import (QPixmap, QImage, QColor, QPainter, QFont,
-                             QPalette, QKeySequence, QDesktopServices)
+    from PyQt5.QtGui import (QPixmap, QImage, QColor, QPainter, QPainterPath,
+                             QFont, QPalette, QKeySequence, QDesktopServices)
 except ImportError:
     sys.exit("PyQt5 required:  pip install PyQt5")
 
@@ -82,31 +84,33 @@ PAD_COLS    = 4
 DEFAULT_FPS = 2
 PAD_W, PAD_H = 185, 185
 
-# Stream Deck White — body / chrome (light theme)
-C_BG       = "#EBEBEB"
-C_SURFACE  = "#F5F5F7"
-C_SURFACE2 = "#E5E5EA"
-C_BORDER   = "#C6C6C8"
-C_ACCENT   = "#1A1A1A"
+# Unified Dark Broadcast Theme
+C_BG       = "#121214"
+C_SURFACE  = "#1C1C1F"
+C_SURFACE2 = "#26262A"
+C_BORDER   = "#2E2E34"
+C_ACCENT   = "#0A84FF"
 C_ACTIVE   = "#34C759"
-C_DANGER   = "#FF3B30"
-C_TEXT     = "#1C1C1E"
+C_DANGER   = "#FF453A"
+C_TEXT     = "#F5F5F7"
 C_DIM      = "#8E8E93"
-C_HOVER    = "#E0E0E5"
+C_HOVER    = "#323238"
 
-# Stream Deck White — key / pad face (dark LCD face)
-C_KEY_BG   = "#1A1A1A"
-C_KEY_FT   = "#111111"
+# Pad / LCD key face
+C_KEY_BG   = "#18181B"
+C_KEY_FT   = "#141416"
 C_TEXT_K   = "#F5F5F7"
-C_DIM_K    = "#555558"
+C_DIM_K    = "#636366"
 C_WEBCAM   = "#FF9F0A"   # Elgato signature orange
 C_QUAD     = "#0A84FF"   # Apple blue — quad-project accent
-C_VIRTUAL  = "#30D158"   # Apple green — meeting virtual screen
+C_MEDIA    = "#BF5AF2"   # Apple purple — image/video media pad
+C_CAMERA   = "#30D158"   # Apple green — camera PIP overlay
 
 # Special pad indices (zero-based)
-VIRTUAL_PADS      = (4, 5)  # Pads 5 & 6 — meeting virtual screen shares
-QUAD_PAD          = 6       # projects Pads 1-4 as a 2×2 grid
-WEBCAM_PAD_VIDEO  = 7       # video file → virtual webcam
+MEDIA_PAD         = 4       # Pad 5 — image or video file to show on screen
+CAMERA_PIP_PAD    = 5       # Pad 6 — webcam/camera input as lower-right PIP
+QUAD_PAD          = 6       # Pad 7 — projects Pads 1-4 as a 2×2 grid
+WEBCAM_PAD_VIDEO  = 7       # Pad 8 — video file / screen → virtual webcam
 
 # ── driver / config paths ──────────────────────────────────────────────────────
 
@@ -2753,7 +2757,11 @@ class SourceType(Enum):
     EMPTY  = "empty"
     SCREEN = "screen"
     WINDOW = "window"
+    IMAGE  = "image"
     VIDEO  = "video"
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif"}
+_VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".m4v", ".webm"}
 
 @dataclass
 class WinInfo:
@@ -2780,6 +2788,7 @@ class PadConfig:
     sid:   Optional[str] = None
     sname: str = "Empty"
     projected: bool = False
+    loop: bool = True
 
     @property
     def display_name(self) -> str:
@@ -2906,6 +2915,72 @@ class Bridge:
                 pass
         return wins
 
+    @staticmethod
+    def cameras(max_probe: int = 6) -> List[int]:
+        """Probe available physical camera indices via OpenCV."""
+        if not HAS_CV2:
+            return []
+        found = []
+        backend = cv2.CAP_DSHOW if PLATFORM == "Windows" else cv2.CAP_ANY
+        for i in range(max_probe):
+            cap = cv2.VideoCapture(i, backend)
+            if not cap.isOpened() and backend != cv2.CAP_ANY:
+                cap.release()
+                cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                found.append(i)
+            cap.release()
+        return found
+
+
+def compose_pip_frame(main_px: QPixmap, target_size: QSize,
+                      pip_px: Optional[QPixmap] = None,
+                      size_pct: int = 25, margin: int = 24,
+                      rounded: bool = True) -> QPixmap:
+    """Render main_px centered into target_size with optional lower-right PIP."""
+    w = max(1, target_size.width())
+    h = max(1, target_size.height())
+    canvas = QPixmap(w, h)
+    canvas.fill(Qt.black)
+    p = QPainter(canvas)
+    p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+    p.setRenderHint(QPainter.Antialiasing, True)
+
+    if main_px and not main_px.isNull():
+        sc = main_px.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        ox = (w - sc.width()) // 2
+        oy = (h - sc.height()) // 2
+        p.drawPixmap(ox, oy, sc)
+
+    if pip_px and not pip_px.isNull():
+        pip_w = max(80, int(w * max(10, min(50, size_pct)) / 100.0))
+        pip_sc = pip_px.scaledToWidth(pip_w, Qt.SmoothTransformation)
+        # Clamp height if needed
+        max_h = int(h * 0.45)
+        if pip_sc.height() > max_h:
+            pip_sc = pip_px.scaledToHeight(max_h, Qt.SmoothTransformation)
+        pw, ph = pip_sc.width(), pip_sc.height()
+        m = max(4, int(margin * (w / 1920.0))) if w < 1280 else margin
+        px = max(0, w - pw - m)
+        py = max(0, h - ph - m)
+        if rounded:
+            radius = max(6, min(16, pw // 20))
+            path = QPainterPath()
+            path.addRoundedRect(px, py, pw, ph, radius, radius)
+            p.save()
+            p.setClipPath(path)
+            p.drawPixmap(px, py, pip_sc)
+            p.restore()
+            p.setPen(QColor(255, 255, 255, 170))
+            p.drawRoundedRect(px, py, pw, ph, radius, radius)
+        else:
+            p.drawPixmap(px, py, pip_sc)
+            p.setPen(QColor(255, 255, 255, 140))
+            p.drawRect(px, py, pw, ph)
+
+    p.end()
+    return canvas
+
 # ── capture engine ─────────────────────────────────────────────────────────────
 
 class Capture:
@@ -3031,10 +3106,10 @@ class CaptureThread(QThread):
             for cfg in cfgs:
                 if not self._live:
                     break
-                if cfg.stype in (SourceType.EMPTY, SourceType.VIDEO):
+                if cfg.stype in (SourceType.EMPTY, SourceType.IMAGE, SourceType.VIDEO):
                     continue
-                # WebcamThread handles previews for webcam pads
-                if cfg.index in (QUAD_PAD, WEBCAM_PAD_VIDEO):
+                # Special pads handle their own previews
+                if cfg.index in (CAMERA_PIP_PAD, QUAD_PAD, WEBCAM_PAD_VIDEO):
                     continue
                 px = Capture.for_pad(cfg, ss, ws)
                 if px:
@@ -3046,6 +3121,7 @@ class CaptureThread(QThread):
 
 class ProjectorThread(QThread):
     frame = pyqtSignal(QPixmap)
+    error = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -3058,6 +3134,12 @@ class ProjectorThread(QThread):
         self._live   = False
         self._mu     = threading.Lock()
         self._last_frame: Optional[QPixmap] = None  # freeze-on-minimise cache
+        self._img_path: str = ""
+        self._img_px: Optional[QPixmap] = None
+        self._vid_path: str = ""
+        self._vid_cap = None
+        self._vid_fps: float = 25.0
+        self._audio_proc = None
 
     def set_target(self, cfg: PadConfig, screens: List[ScreenInfo],
                    windows: List[WinInfo]):
@@ -3089,29 +3171,123 @@ class ProjectorThread(QThread):
     def stop(self):
         self._live = False
 
+    def _release_video(self):
+        if self._vid_cap is not None:
+            try:
+                self._vid_cap.release()
+            except Exception:
+                pass
+            self._vid_cap = None
+        self._vid_path = ""
+        if self._audio_proc is not None:
+            try:
+                self._audio_proc.terminate()
+            except Exception:
+                pass
+            self._audio_proc = None
+
+    def _start_audio(self, path: str):
+        try:
+            flags = 0x08000000 if PLATFORM == "Windows" else 0
+            self._audio_proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-vn", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags,
+            )
+        except (FileNotFoundError, OSError):
+            self._audio_proc = None
+
     def run(self):
         self._live = True
-        while self._live:
-            t0 = time.time()
-            with self._mu:
-                quad, cfg, pads = self._quad_mode, self._cfg, self._quad_pads[:]
-                ss, ws = self._screens[:], self._windows[:]
-            if quad:
-                composite = self._compose_quad(pads, ss, ws)
-                if composite:
-                    self._last_frame = composite
-                    self.frame.emit(composite)
-                elif self._last_frame:
-                    self.frame.emit(self._last_frame)  # freeze on minimised quad pad
-            elif cfg and cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
-                px = Capture.for_pad(cfg, ss, ws)
-                if px:
-                    self._last_frame = px
-                    self.frame.emit(px)
-                elif self._last_frame:
-                    self.frame.emit(self._last_frame)  # freeze on minimised window
-            dt = time.time() - t0
-            time.sleep(max(0.0, 1.0 / self._fps - dt))
+        try:
+            while self._live:
+                t0 = time.time()
+                with self._mu:
+                    quad, cfg, pads = self._quad_mode, self._cfg, self._quad_pads[:]
+                    ss, ws = self._screens[:], self._windows[:]
+
+                target_fps = self._fps
+
+                if quad:
+                    self._release_video()
+                    composite = self._compose_quad(pads, ss, ws)
+                    if composite:
+                        self._last_frame = composite
+                        self.frame.emit(composite)
+                    elif self._last_frame:
+                        self.frame.emit(self._last_frame)
+
+                elif cfg and cfg.stype == SourceType.IMAGE:
+                    self._release_video()
+                    path = cfg.sid or ""
+                    if path != self._img_path:
+                        self._img_path = path
+                        px = QPixmap(path)
+                        self._img_px = px if not px.isNull() else None
+                    if self._img_px:
+                        self.frame.emit(self._img_px)
+                    target_fps = min(self._fps, 15)
+
+                elif cfg and cfg.stype == SourceType.VIDEO:
+                    path = cfg.sid or ""
+                    if path != self._vid_path:
+                        self._release_video()
+                        self._vid_path = path
+                        if not HAS_CV2:
+                            self.error.emit("opencv-python is required for video playback.")
+                            self._live = False
+                            break
+                        cap = cv2.VideoCapture(path)
+                        if not cap.isOpened():
+                            cap.release()
+                            self.error.emit(f"Could not open video file:\n{path}")
+                            self._live = False
+                            break
+                        self._vid_cap = cap
+                        self._vid_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                        if self._vid_fps <= 1 or self._vid_fps > 120:
+                            self._vid_fps = 25.0
+                        self._start_audio(path)
+
+                    if self._vid_cap is not None:
+                        ret, frame = self._vid_cap.read()
+                        if not ret:
+                            if cfg.loop:
+                                self._vid_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                                ret, frame = self._vid_cap.read()
+                                if self._audio_proc is not None:
+                                    try:
+                                        self._audio_proc.terminate()
+                                    except Exception:
+                                        pass
+                                    self._audio_proc = None
+                                    self._start_audio(path)
+                        if ret and frame is not None:
+                            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                            h, w, _ = rgb.shape
+                            qi = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                            px = QPixmap.fromImage(qi)
+                            self._last_frame = px
+                            self.frame.emit(px)
+                        elif self._last_frame:
+                            self.frame.emit(self._last_frame)
+                        target_fps = self._vid_fps
+
+                elif cfg and cfg.stype != SourceType.EMPTY:
+                    self._release_video()
+                    px = Capture.for_pad(cfg, ss, ws)
+                    if px:
+                        self._last_frame = px
+                        self.frame.emit(px)
+                    elif self._last_frame:
+                        self.frame.emit(self._last_frame)  # freeze on minimised window
+                else:
+                    self._release_video()
+
+                dt = time.time() - t0
+                time.sleep(max(0.0, 1.0 / max(1.0, target_fps) - dt))
+        finally:
+            self._release_video()
 
     @staticmethod
     def _compose_quad(pads: List["PadConfig"], ss: list, ws: list) -> Optional[QPixmap]:
@@ -3145,43 +3321,64 @@ class ProjectorThread(QThread):
         painter.end()
         return QPixmap.fromImage(result) if any_frame else None
 
-# ── virtual screen thread ──────────────────────────────────────────────────────
+# ── camera PIP capture thread ─────────────────────────────────────────────────
 
-class VirtualScreenThread(QThread):
-    """Captures a configured source and feeds VirtualScreenWindow at ~30 fps."""
+class CameraPipThread(QThread):
+    """Captures physical webcam/camera feed for Pad 6 lower-right PIP overlay."""
     frame   = pyqtSignal(QPixmap)
+    error   = pyqtSignal(str)
     stopped = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self, cam_index: int = 0, width: int = 1280, height: int = 720,
+                 mirror: bool = False):
         super().__init__()
-        self._live    = False
-        self._mu      = threading.Lock()
-        self._cfg:     Optional[PadConfig] = None
-        self._screens: list = []
-        self._windows: list = []
-
-    def set_source(self, cfg: "PadConfig", screens, windows):
-        with self._mu:
-            self._cfg     = cfg
-            self._screens = list(screens)
-            self._windows = list(windows)
+        self._cam_index = cam_index
+        self._width     = width
+        self._height    = height
+        self._mirror    = mirror
+        self._live      = False
 
     def stop(self):
         self._live = False
 
     def run(self):
+        if not HAS_CV2:
+            self.error.emit(
+                "opencv-python is required for camera input.\n\n"
+                "Install:  pip install opencv-python")
+            self.stopped.emit()
+            return
+        backend = cv2.CAP_DSHOW if PLATFORM == "Windows" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(self._cam_index, backend)
+        if not cap.isOpened() and backend != cv2.CAP_ANY:
+            cap.release()
+            cap = cv2.VideoCapture(self._cam_index)
+        if not cap.isOpened():
+            cap.release()
+            self.error.emit(
+                f"Could not open Camera {self._cam_index}.\n\n"
+                "Check that the camera is connected and not in use by another app.")
+            self.stopped.emit()
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         self._live = True
-        while self._live:
-            t0 = time.time()
-            with self._mu:
-                cfg, ss, ws = self._cfg, self._screens[:], self._windows[:]
-            if cfg and cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
-                px = Capture.for_pad(cfg, ss, ws)
-                if px:
-                    self.frame.emit(px)
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, 1.0 / 30 - elapsed))
-        self.stopped.emit()
+        try:
+            while self._live:
+                t0 = time.time()
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    if self._mirror:
+                        frame = cv2.flip(frame, 1)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, _ = rgb.shape
+                    qi = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                    self.frame.emit(QPixmap.fromImage(qi))
+                dt = time.time() - t0
+                time.sleep(max(0.005, 1.0 / 30 - dt))
+        finally:
+            cap.release()
+            self.stopped.emit()
 
 # ── webcam output thread ───────────────────────────────────────────────────────
 
@@ -3358,7 +3555,9 @@ class PadWidget(QFrame):
         self._setup()
 
     def _setup(self):
-        self.setFixedSize(PAD_W, PAD_H)
+        from PyQt5.QtWidgets import QSizePolicy
+        self.setMinimumSize(170, 128)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setObjectName("Pad")
         self.setCursor(Qt.PointingHandCursor)
 
@@ -3369,6 +3568,8 @@ class PadWidget(QFrame):
         self.preview = QLabel()
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setObjectName("Preview")
+        self.preview.setMinimumHeight(96)
+        self.preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._placeholder()
 
         footer = QWidget()
@@ -3382,9 +3583,7 @@ class PadWidget(QFrame):
         self.dot.setObjectName("Dot")
         self.dot.setFixedWidth(10)
 
-        _footer_name = (f"Meeting Screen {VIRTUAL_PADS.index(self.cfg.index) + 1}"
-                        if self.cfg.index in VIRTUAL_PADS else self.cfg.display_name)
-        self.name = QLabel(_footer_name)
+        self.name = QLabel(self._default_footer_name())
         self.name.setObjectName("Name")
 
         self.sc_lbl = QLabel(f"Ctrl+{self.cfg.index + 1}")
@@ -3410,6 +3609,17 @@ class PadWidget(QFrame):
         vl.addWidget(footer)
         self._restyle()
 
+    def _default_footer_name(self) -> str:
+        if self.cfg.index == MEDIA_PAD and self.cfg.stype == SourceType.EMPTY:
+            return "Media (Image/Video)"
+        if self.cfg.index == CAMERA_PIP_PAD:
+            return self.cfg.label or "Camera PIP"
+        if self.cfg.index == QUAD_PAD:
+            return "Quad Project"
+        if self.cfg.index == WEBCAM_PAD_VIDEO and self.cfg.stype == SourceType.EMPTY:
+            return "Virtual Webcam"
+        return self.cfg.display_name
+
     def _placeholder(self):
         from PyQt5.QtCore import QRect
         ph_h = PAD_H - 28   # 157 px
@@ -3417,26 +3627,34 @@ class PadWidget(QFrame):
         pm.fill(QColor(C_KEY_BG))
         p = QPainter(pm)
 
-        if self.cfg.index in VIRTUAL_PADS:
-            num = VIRTUAL_PADS.index(self.cfg.index) + 1
-            # Monitor icon
-            p.setPen(QColor(C_VIRTUAL))
-            p.setBrush(Qt.NoBrush)
-            mx, my, mw, mh = (PAD_W - 54) // 2, 14, 54, 36
-            p.drawRoundedRect(mx, my, mw, mh, 3, 3)
-            p.drawLine(PAD_W // 2, my + mh, PAD_W // 2, my + mh + 7)
-            p.drawLine(PAD_W // 2 - 10, my + mh + 7, PAD_W // 2 + 10, my + mh + 7)
-            # Labels
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 9, QFont.Bold))
-            p.drawText(QRect(0, 68, PAD_W, 20), Qt.AlignCenter, "MEETING")
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 7, QFont.Bold))
-            p.drawText(QRect(0, 86, PAD_W, 18), Qt.AlignCenter, "VIRTUAL SCREEN")
-            p.drawText(QRect(0, 102, PAD_W, 18), Qt.AlignCenter, f"SHARE  {num}")
-            # Hint
+        if self.cfg.index == MEDIA_PAD:
+            p.setPen(QColor(C_MEDIA))
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 18, QFont.Bold))
+            p.drawText(QRect(0, 14, PAD_W, 34), Qt.AlignCenter, "🖼  ▶")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 12, QFont.Bold))
+            p.drawText(QRect(0, 56, PAD_W, 24), Qt.AlignCenter, "IMAGE /")
+            p.drawText(QRect(0, 80, PAD_W, 24), Qt.AlignCenter, "VIDEO")
             p.setPen(QColor(C_DIM_K))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 7))
-            p.drawText(QRect(4, 128, PAD_W - 8, 20), Qt.AlignCenter,
-                       "share in Zoom / Teams")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
+            p.drawText(QRect(4, 122, PAD_W - 8, 20), Qt.AlignCenter,
+                       "click or ⚙ to select")
+
+        elif self.cfg.index == CAMERA_PIP_PAD:
+            p.setPen(QColor(C_CAMERA))
+            p.setBrush(QColor(C_CAMERA + "28"))
+            # Outer screen + lower-right PIP box icon
+            p.drawRoundedRect((PAD_W - 64) // 2, 16, 64, 42, 4, 4)
+            p.setBrush(QColor(C_CAMERA))
+            p.drawRoundedRect((PAD_W - 64) // 2 + 36, 16 + 22, 24, 16, 2, 2)
+            p.setBrush(Qt.NoBrush)
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 12, QFont.Bold))
+            p.drawText(QRect(0, 68, PAD_W, 24), Qt.AlignCenter, "CAMERA PIP")
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8, QFont.Bold))
+            p.drawText(QRect(0, 92, PAD_W, 18), Qt.AlignCenter, "LOWER RIGHT")
+            p.setPen(QColor(C_DIM_K))
+            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
+            p.drawText(QRect(4, 124, PAD_W - 8, 20), Qt.AlignCenter,
+                       "click ON/OFF • ⚙ setup")
 
         elif self.cfg.index == QUAD_PAD:
             # 2×2 grid icon
@@ -3451,26 +3669,21 @@ class PadWidget(QFrame):
                 for c in range(2):
                     p.drawRect(sx + c * (cell + gap), sy + r * (cell + gap), cell, cell)
             p.setBrush(Qt.NoBrush)
-            # Labels
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
             p.drawText(QRect(0, 72, PAD_W, 26), Qt.AlignCenter, "QUAD")
             p.drawText(QRect(0, 96, PAD_W, 22), Qt.AlignCenter, "PROJECT")
-            # Hint
             p.setPen(QColor(C_DIM_K))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
             p.drawText(QRect(4, 130, PAD_W - 8, 20), Qt.AlignCenter,
                        "click to project Pads 1–4")
 
         elif self.cfg.index == WEBCAM_PAD_VIDEO:
-            # Symbol row: play + screen icons side by side
             p.setPen(QColor(C_WEBCAM))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 18, QFont.Bold))
             p.drawText(QRect(0, 12, PAD_W, 36), Qt.AlignCenter, "▶  🖥")
-            # Label rows
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
             p.drawText(QRect(0, 60, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
             p.drawText(QRect(0, 86, PAD_W, 26), Qt.AlignCenter, "OUTPUT")
-            # Hint row
             p.setPen(QColor(C_DIM_K))
             p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
             p.drawText(QRect(4, 125, PAD_W - 8, 22), Qt.AlignCenter,
@@ -3486,8 +3699,10 @@ class PadWidget(QFrame):
         self.preview.setPixmap(pm)
 
     def set_frame(self, px: QPixmap):
-        scaled = px.scaled(self.preview.size(),
-                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        sz = self.preview.size()
+        if sz.width() < 10 or sz.height() < 10:
+            sz = QSize(PAD_W, PAD_H - 28)
+        scaled = px.scaled(sz, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
 
     def set_state(self, projected: bool = False, selected: bool = False,
@@ -3496,16 +3711,17 @@ class PadWidget(QFrame):
         self._selected    = selected
         self._webcam_live = webcam
         self._restyle()
-        if webcam:
+        if webcam and self.cfg.index == CAMERA_PIP_PAD:
+            dot_color = C_CAMERA
+        elif webcam:
             dot_color = C_WEBCAM
-        elif projected and self.cfg.index in VIRTUAL_PADS:
-            dot_color = C_VIRTUAL
         elif projected:
-            dot_color = C_ACTIVE
+            dot_color = C_QUAD if self.cfg.index == QUAD_PAD else (
+                C_MEDIA if self.cfg.index == MEDIA_PAD else C_ACTIVE)
         elif selected:
             dot_color = "#FFFFFF"
-        elif self.cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
-            dot_color = "#666668"
+        elif self.cfg.stype != SourceType.EMPTY:
+            dot_color = "#8E8E93"
         else:
             dot_color = C_DIM_K
         self.dot.setStyleSheet(
@@ -3513,38 +3729,40 @@ class PadWidget(QFrame):
 
     def update_cfg(self, cfg: PadConfig):
         self.cfg = cfg
-        if cfg.index in VIRTUAL_PADS and cfg.stype == SourceType.EMPTY:
-            num = VIRTUAL_PADS.index(cfg.index) + 1
-            self.name.setText(f"Meeting Screen {num}")
-        else:
-            self.name.setText(cfg.display_name)
-        if cfg.stype in (SourceType.EMPTY, SourceType.VIDEO):
+        self.name.setText(self._default_footer_name())
+        if cfg.stype == SourceType.EMPTY:
             self._placeholder()
         self._restyle()
 
     def _restyle(self):
-        is_virtual = self.cfg.index in VIRTUAL_PADS
-        is_quad    = self.cfg.index == QUAD_PAD
-        is_webcam  = self.cfg.index == WEBCAM_PAD_VIDEO
-        if self._webcam_live:
+        is_media  = self.cfg.index == MEDIA_PAD
+        is_camera = self.cfg.index == CAMERA_PIP_PAD
+        is_quad   = self.cfg.index == QUAD_PAD
+        is_webcam = self.cfg.index == WEBCAM_PAD_VIDEO
+        if self._webcam_live and is_camera:
+            border = f"2px solid {C_CAMERA}"
+        elif self._webcam_live:
             border = f"2px solid {C_WEBCAM}"
         elif self._projected:
-            border = (f"2px solid {C_VIRTUAL}" if is_virtual else
+            border = (f"2px solid {C_MEDIA}" if is_media else
                       f"2px solid {C_QUAD}" if is_quad else f"2px solid {C_ACTIVE}")
         elif self._selected:
             border = "2px solid #FFFFFF"
-        elif self.cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
-            border = f"1px solid {C_VIRTUAL}44" if is_virtual else f"1px solid {C_ACTIVE}44"
-        elif is_virtual:
-            border = f"1px solid {C_VIRTUAL}44"
+        elif self.cfg.stype != SourceType.EMPTY:
+            border = f"1px solid {C_MEDIA}66" if is_media else f"1px solid {C_ACTIVE}55"
+        elif is_media:
+            border = f"1px solid {C_MEDIA}44"
+        elif is_camera:
+            border = f"1px solid {C_CAMERA}44"
         elif is_quad:
             border = f"1px solid {C_QUAD}44"
         elif is_webcam:
             border = f"1px solid {C_WEBCAM}44"
         else:
-            border = "1px solid #2E2E2E"
+            border = f"1px solid {C_BORDER}"
 
-        hover_border = (C_VIRTUAL if is_virtual else
+        hover_border = (C_MEDIA if is_media else
+                        C_CAMERA if is_camera else
                         C_QUAD if is_quad else
                         C_WEBCAM if is_webcam else "#FFFFFF")
 
@@ -3596,29 +3814,37 @@ QLabel#ShortcutLbl{{
             f"QMenu::item{{padding:6px 20px;border-radius:3px}}"
             f"QMenu::item:selected{{background:#2D2D2D}}"
         )
-        is_virtual = self.cfg.index in VIRTUAL_PADS
-        is_quad    = self.cfg.index == QUAD_PAD
-        is_webcam  = self.cfg.index == WEBCAM_PAD_VIDEO
-        if is_virtual:
-            a1 = m.addAction("MON  Project Virtual Screen")
+        is_media  = self.cfg.index == MEDIA_PAD
+        is_camera = self.cfg.index == CAMERA_PIP_PAD
+        is_quad   = self.cfg.index == QUAD_PAD
+        is_webcam = self.cfg.index == WEBCAM_PAD_VIDEO
+        if is_camera:
+            label = "CAM   Turn Camera PIP Off" if self._webcam_live else "CAM   Turn Camera PIP On"
+            a1 = m.addAction(label)
             a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
             m.addSeparator()
-            a2 = m.addAction("CONF  Configure Source...")
+            a2 = m.addAction("CONF  Camera & PIP Settings...")
             a2.triggered.connect(lambda: self.configure.emit(self.cfg.index))
-            m.exec_(e.globalPos())
-            return
-        if is_quad:
+        elif is_quad:
             a1 = m.addAction("GRID  Quad Project (Pads 1–4)")
             a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
-            m.exec_(e.globalPos())
-            return
-        if is_webcam:
+        elif is_webcam:
             label = "CAM  Start Webcam Output"
             a1 = m.addAction(label)
             a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
             m.addSeparator()
             a2 = m.addAction("CONF  Configure Source...")
             a2.triggered.connect(lambda: self.configure.emit(self.cfg.index))
+        elif is_media:
+            a1 = m.addAction("PLAY  Project Media")
+            a1.setEnabled(self.cfg.stype != SourceType.EMPTY)
+            a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
+            m.addSeparator()
+            a2 = m.addAction("CONF  Select Image / Video...")
+            a2.triggered.connect(lambda: self.configure.emit(self.cfg.index))
+            a3 = m.addAction("CLR   Clear Pad")
+            a3.setEnabled(self.cfg.stype != SourceType.EMPTY)
+            a3.triggered.connect(self._clear)
         else:
             a1 = m.addAction("PLAY  Project This Pad")
             a1.setEnabled(self.cfg.stype != SourceType.EMPTY)
@@ -3638,29 +3864,29 @@ QLabel#ShortcutLbl{{
         self.cfg.label = ""
         self.update_cfg(self.cfg)
 
-# ── dialog stylesheet (light theme) ───────────────────────────────────────────
+# ── dialog stylesheet (dark broadcast theme) ──────────────────────────────────
 
 _DLGSS = f"""
 QDialog{{background:{C_SURFACE};color:{C_TEXT}}}
-QLabel{{color:{C_TEXT}}}
+QLabel, QCheckBox, QRadioButton{{color:{C_TEXT}}}
 QGroupBox{{
   color:{C_DIM};border:1px solid {C_BORDER};
   border-radius:6px;margin-top:10px;padding-top:8px;font-size:11px
 }}
 QGroupBox::title{{subcontrol-origin:margin;padding:0 6px;color:{C_DIM}}}
 QComboBox,QListWidget,QLineEdit{{
-  background:{C_SURFACE};border:1px solid {C_BORDER};
+  background:{C_SURFACE2};border:1px solid {C_BORDER};
   border-radius:4px;color:{C_TEXT};padding:4px 8px
 }}
 QComboBox::drop-down{{border:none}}
 QComboBox QAbstractItemView{{
-  background:{C_SURFACE};border:1px solid {C_BORDER};
+  background:{C_SURFACE2};border:1px solid {C_BORDER};
   color:{C_TEXT};selection-background-color:{C_HOVER}
 }}
 QListWidget::item{{padding:5px}}
 QListWidget::item:selected{{
-  background:{C_ACTIVE}22;
-  border:1px solid {C_ACTIVE}44;
+  background:{C_ACCENT}33;
+  border:1px solid {C_ACCENT}66;
   border-radius:3px
 }}
 QPushButton{{
@@ -3669,7 +3895,7 @@ QPushButton{{
 }}
 QPushButton:hover{{background:{C_HOVER}}}
 QPushButton#OK{{background:{C_ACCENT};border:none;color:#FFFFFF;font-weight:600}}
-QPushButton#OK:hover{{background:#333333}}
+QPushButton#OK:hover{{background:#0070E0}}
 """
 
 # ── app config (persists to %APPDATA%\ProjectionPad\config.json) ───────────────
@@ -4163,6 +4389,227 @@ class VideoWebcamConfigDialog(QDialog):
         self._path = p
         self.accept()
 
+# ── media config dialog (Pad 5: Image or Video) ────────────────────────────────
+
+class MediaConfigDialog(QDialog):
+    def __init__(self, cfg: PadConfig, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.setWindowTitle(f"Media Source — Pad {cfg.index + 1}")
+        self.setModal(True)
+        self.setFixedSize(500, 250)
+        self.setStyleSheet(_DLGSS)
+        self._build()
+
+    def _build(self):
+        vl = QVBoxLayout(self)
+        vl.setSpacing(10)
+        vl.setContentsMargins(16, 16, 16, 16)
+
+        info = QLabel(
+            "Select an image or video file to show on the projected screen.")
+        info.setStyleSheet(f"color:{C_DIM};font-size:11px;")
+        vl.addWidget(info)
+
+        row = QHBoxLayout()
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select an image (.png, .jpg) or video (.mp4, .mkv)...")
+        if self.cfg.sid:
+            self.path_edit.setText(self.cfg.sid)
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse)
+        row.addWidget(self.path_edit, 1)
+        row.addWidget(browse)
+        vl.addLayout(row)
+
+        lbl_row = QHBoxLayout()
+        lbl_row.addWidget(QLabel("Label:"))
+        self.lbl_edit = QLineEdit()
+        self.lbl_edit.setPlaceholderText("Optional custom pad name...")
+        self.lbl_edit.setText(self.cfg.label)
+        lbl_row.addWidget(self.lbl_edit, 1)
+        vl.addLayout(lbl_row)
+
+        self.loop_cb = QCheckBox("Loop video playback")
+        self.loop_cb.setChecked(self.cfg.loop)
+        vl.addWidget(self.loop_cb)
+
+        btns = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Apply")
+        ok.setObjectName("OK")
+        ok.clicked.connect(self._apply)
+        btns.addStretch()
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        vl.addStretch()
+        vl.addLayout(btns)
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image or Video", "",
+            "Media Files (*.png *.jpg *.jpeg *.bmp *.webp *.gif "
+            "*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.m4v *.webm);;"
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif);;"
+            "Videos (*.mp4 *.mkv *.avi *.mov *.wmv *.flv *.m4v *.webm);;"
+            "All Files (*)")
+        if path:
+            self.path_edit.setText(path)
+
+    def _apply(self):
+        p = self.path_edit.text().strip()
+        if not p:
+            QMessageBox.warning(self, "No File", "Please select an image or video file.")
+            return
+        if not os.path.isfile(p):
+            QMessageBox.warning(self, "File Not Found", f"File not found:\n{p}")
+            return
+        ext = os.path.splitext(p)[1].lower()
+        if ext in _IMAGE_EXTS:
+            self.cfg.stype = SourceType.IMAGE
+        elif ext in _VIDEO_EXTS:
+            if not HAS_CV2:
+                QMessageBox.warning(
+                    self, "OpenCV Required",
+                    "opencv-python is required for video playback.\n"
+                    "Install: pip install opencv-python")
+                return
+            self.cfg.stype = SourceType.VIDEO
+        else:
+            # Try loading as QPixmap first, otherwise treat as video
+            px = QPixmap(p)
+            self.cfg.stype = SourceType.IMAGE if not px.isNull() else SourceType.VIDEO
+        self.cfg.sid   = p
+        self.cfg.sname = os.path.basename(p)
+        self.cfg.label = self.lbl_edit.text().strip()
+        self.cfg.loop  = self.loop_cb.isChecked()
+        self.accept()
+
+# ── camera PIP config dialog (Pad 6) ───────────────────────────────────────────
+
+class CameraPipConfigDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Camera & PIP Settings — Pad 6")
+        self.setModal(True)
+        self.setFixedSize(440, 340)
+        self.setStyleSheet(_DLGSS)
+        self._build()
+
+    def _build(self):
+        vl = QVBoxLayout(self)
+        vl.setSpacing(12)
+        vl.setContentsMargins(18, 16, 18, 16)
+
+        # Camera device
+        r1 = QHBoxLayout()
+        lbl1 = QLabel("Camera Device:")
+        lbl1.setFixedWidth(120)
+        self.cam_cb = QComboBox()
+        detect_btn = QPushButton("Detect")
+        detect_btn.setFixedWidth(78)
+        detect_btn.clicked.connect(self._detect)
+        r1.addWidget(lbl1)
+        r1.addWidget(self.cam_cb, 1)
+        r1.addWidget(detect_btn)
+        vl.addLayout(r1)
+
+        # Resolution
+        r2 = QHBoxLayout()
+        lbl2 = QLabel("Resolution:")
+        lbl2.setFixedWidth(120)
+        self.res_cb = QComboBox()
+        for res in ("640x480", "1280x720", "1920x1080"):
+            self.res_cb.addItem(res, res)
+        cur_res = AppConfig.get("pip_res", "1280x720")
+        idx = self.res_cb.findData(cur_res)
+        if idx >= 0:
+            self.res_cb.setCurrentIndex(idx)
+        r2.addWidget(lbl2)
+        r2.addWidget(self.res_cb, 1)
+        vl.addLayout(r2)
+
+        # PIP Size %
+        r3 = QHBoxLayout()
+        lbl3 = QLabel("PIP Size:")
+        lbl3.setFixedWidth(120)
+        self.size_sl = QSlider(Qt.Horizontal)
+        self.size_sl.setRange(12, 45)
+        cur_sz = int(AppConfig.get("pip_size_pct", 25))
+        self.size_sl.setValue(cur_sz)
+        self.size_val = QLabel(f"{cur_sz}%")
+        self.size_val.setFixedWidth(40)
+        self.size_sl.valueChanged.connect(lambda v: self.size_val.setText(f"{v}%"))
+        r3.addWidget(lbl3)
+        r3.addWidget(self.size_sl, 1)
+        r3.addWidget(self.size_val)
+        vl.addLayout(r3)
+
+        # PIP Margin px
+        r4 = QHBoxLayout()
+        lbl4 = QLabel("Corner Margin:")
+        lbl4.setFixedWidth(120)
+        self.margin_sl = QSlider(Qt.Horizontal)
+        self.margin_sl.setRange(0, 80)
+        cur_mg = int(AppConfig.get("pip_margin", 24))
+        self.margin_sl.setValue(cur_mg)
+        self.margin_val = QLabel(f"{cur_mg} px")
+        self.margin_val.setFixedWidth(48)
+        self.margin_sl.valueChanged.connect(lambda v: self.margin_val.setText(f"{v} px"))
+        r4.addWidget(lbl4)
+        r4.addWidget(self.margin_sl, 1)
+        r4.addWidget(self.margin_val)
+        vl.addLayout(r4)
+
+        self.mirror_cb = QCheckBox("Mirror camera horizontally")
+        self.mirror_cb.setChecked(bool(AppConfig.get("pip_mirror", False)))
+        vl.addWidget(self.mirror_cb)
+
+        self.round_cb = QCheckBox("Rounded corners & border on PIP")
+        self.round_cb.setChecked(bool(AppConfig.get("pip_rounded", True)))
+        vl.addWidget(self.round_cb)
+
+        self._populate_cameras(probe=False)
+
+        btns = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Save Settings")
+        ok.setObjectName("OK")
+        ok.clicked.connect(self._apply)
+        btns.addStretch()
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        vl.addStretch()
+        vl.addLayout(btns)
+
+    def _populate_cameras(self, probe: bool = True):
+        self.cam_cb.clear()
+        saved_idx = int(AppConfig.get("pip_cam_index", 0))
+        cams = Bridge.cameras() if probe else []
+        if not cams:
+            for i in range(4):
+                self.cam_cb.addItem(f"Camera {i}", i)
+        else:
+            for i in cams:
+                self.cam_cb.addItem(f"Camera {i} (Detected)", i)
+        idx = self.cam_cb.findData(saved_idx)
+        if idx >= 0:
+            self.cam_cb.setCurrentIndex(idx)
+
+    def _detect(self):
+        self._populate_cameras(probe=True)
+
+    def _apply(self):
+        AppConfig.set("pip_cam_index", int(self.cam_cb.currentData() or 0))
+        AppConfig.set("pip_res", str(self.res_cb.currentData() or "1280x720"))
+        AppConfig.set("pip_size_pct", int(self.size_sl.value()))
+        AppConfig.set("pip_margin", int(self.margin_sl.value()))
+        AppConfig.set("pip_mirror", bool(self.mirror_cb.isChecked()))
+        AppConfig.set("pip_rounded", bool(self.round_cb.isChecked()))
+        self.accept()
+
 # ── display settings dialog ────────────────────────────────────────────────────
 
 class DisplaySettingsDialog(QDialog):
@@ -4335,6 +4782,11 @@ class Projector(QMainWindow):
         self._info = QLabel("Projection Pad", self)
         self._info.setStyleSheet(
             "color: rgba(255,255,255,.35); font-size: 12px; padding: 6px;")
+        self._main_px: Optional[QPixmap] = None
+        self._pip_px: Optional[QPixmap] = None
+        self._pip_size_pct: int = 25
+        self._pip_margin: int = 24
+        self._pip_rounded: bool = True
 
     def place(self, si: Optional[ScreenInfo]):
         ss = QApplication.screens()
@@ -4345,12 +4797,26 @@ class Projector(QMainWindow):
         else:
             self.setGeometry(ss[0].geometry())
 
+    def set_pip(self, pip_px: Optional[QPixmap], size_pct: int = 25,
+                margin: int = 24, rounded: bool = True):
+        self._pip_px       = pip_px
+        self._pip_size_pct = size_pct
+        self._pip_margin   = margin
+        self._pip_rounded  = rounded
+        self._render()
+
     def push(self, px: Optional[QPixmap], name: str = ""):
-        if px:
-            sc = px.scaled(self._lbl.size(),
-                           Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._lbl.setPixmap(sc)
+        self._main_px = px
+        if name:
             self._info.setText(name)
+        self._render()
+
+    def _render(self):
+        if self._main_px and not self._main_px.isNull():
+            composed = compose_pip_frame(
+                self._main_px, self._lbl.size(), self._pip_px,
+                self._pip_size_pct, self._pip_margin, self._pip_rounded)
+            self._lbl.setPixmap(composed)
             self._lbl.setStyleSheet("background: black;")
         else:
             self._lbl.setPixmap(QPixmap())
@@ -4363,86 +4829,106 @@ class Projector(QMainWindow):
             self.hide()
         super().keyPressEvent(e)
 
-# ── meeting virtual screen window ──────────────────────────────────────────────
+# ── live studio program monitor ────────────────────────────────────────────────
 
-class VirtualScreenWindow(QMainWindow):
-    """Shareable window for meeting screen share — detectable by Zoom/Teams."""
-    closed = pyqtSignal()
+class ProgramMonitor(QFrame):
+    """Live Program / Output preview showing composited main output + lower-right PIP."""
 
-    def __init__(self, pad_number: int = 1):
-        super().__init__()
-        self._pad_number = pad_number
-        # Explicit Qt.Window ensures a proper top-level OS window (no tool-window quirks)
-        self.setWindowFlags(Qt.Window |
-                            Qt.WindowTitleHint |
-                            Qt.WindowMinimizeButtonHint |
-                            Qt.WindowMaximizeButtonHint |
-                            Qt.WindowCloseButtonHint)
-        self.setWindowTitle(f"Projection Pad — Meeting Screen {pad_number}")
-        # Idle overlay shown until a source frame arrives
-        self._idle = QLabel(
-            f"Projection Pad\nMeeting Screen {pad_number}\n\n"
-            "Waiting for source…\n\n"
-            "In Zoom: Share Screen → Window → select this window")
-        self._idle.setAlignment(Qt.AlignCenter)
-        self._idle.setStyleSheet(
-            "background:#111;color:#555;font-size:14px;padding:20px;")
-        self._lbl = QLabel()
-        self._lbl.setAlignment(Qt.AlignCenter)
-        self._lbl.setStyleSheet("background:black;")
-        self._lbl.hide()
-        from PyQt5.QtWidgets import QStackedWidget
-        stack = QStackedWidget()
-        stack.addWidget(self._idle)   # index 0
-        stack.addWidget(self._lbl)    # index 1
-        self._stack = stack
-        self.setCentralWidget(stack)
-        self.resize(1280, 720)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ProgramMonitor")
+        self._live = False
+        self._main_px: Optional[QPixmap] = None
+        self._pip_px: Optional[QPixmap] = None
+        self._pip_size_pct: int = 25
+        self._pip_margin: int = 24
+        self._pip_rounded: bool = True
 
-    def showEvent(self, e):
-        super().showEvent(e)
-        # Defer the Win32 fix: showEvent fires before the HWND is fully
-        # registered with the shell, so the style change must wait until
-        # the event loop has processed the WM_SHOWWINDOW message.
-        if PLATFORM == "Windows":
-            QTimer.singleShot(300, self._fix_win32_style)
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(0)
 
-    def _fix_win32_style(self):
-        """Remove WS_EX_TOOLWINDOW / add WS_EX_APPWINDOW.
-        Without this Qt windows are invisible in Zoom/Teams Share → Window."""
-        if PLATFORM != "Windows":
+        bar = QWidget()
+        bar.setObjectName("ProgBar")
+        bar.setFixedHeight(30)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(12, 0, 12, 0)
+        bl.setSpacing(8)
+
+        self.badge = QLabel("● STANDBY")
+        self.badge.setStyleSheet(
+            f"color:{C_DIM};font-size:10px;font-weight:700;background:transparent;")
+        self.src_lbl = QLabel("No output active")
+        self.src_lbl.setStyleSheet(
+            f"color:{C_TEXT};font-size:11px;font-weight:600;background:transparent;")
+        self.disp_lbl = QLabel("")
+        self.disp_lbl.setStyleSheet(
+            f"color:{C_DIM};font-size:10px;background:transparent;")
+        self.disp_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        bl.addWidget(self.badge)
+        bl.addWidget(self.src_lbl, 1)
+        bl.addWidget(self.disp_lbl)
+
+        self.screen_lbl = QLabel("Select a pad and click Project (Ctrl+P)")
+        self.screen_lbl.setAlignment(Qt.AlignCenter)
+        self.screen_lbl.setMinimumHeight(180)
+        self.screen_lbl.setStyleSheet(
+            f"background:#0A0A0C;color:{C_DIM};font-size:12px;"
+            "border-bottom-left-radius:8px;border-bottom-right-radius:8px;")
+
+        vl.addWidget(bar)
+        vl.addWidget(self.screen_lbl, 1)
+
+    def set_status(self, live: bool, source_name: str = "", disp_name: str = ""):
+        self._live = live
+        if live:
+            self.badge.setText("● LIVE")
+            self.badge.setStyleSheet(
+                f"color:{C_ACTIVE};font-size:10px;font-weight:700;background:transparent;")
+        else:
+            self.badge.setText("● STANDBY")
+            self.badge.setStyleSheet(
+                f"color:{C_DIM};font-size:10px;font-weight:700;background:transparent;")
+            self._main_px = None
+        self.src_lbl.setText(source_name or "No output active")
+        self.disp_lbl.setText(disp_name)
+        self._render()
+
+    def set_pip(self, pip_px: Optional[QPixmap], size_pct: int = 25,
+                margin: int = 24, rounded: bool = True):
+        self._pip_px       = pip_px
+        self._pip_size_pct = size_pct
+        self._pip_margin   = margin
+        self._pip_rounded  = rounded
+        self._render()
+
+    def push(self, px: Optional[QPixmap]):
+        self._main_px = px
+        self._render()
+
+    def _render(self):
+        sz = self.screen_lbl.size()
+        if sz.width() < 20 or sz.height() < 20:
             return
-        try:
-            import ctypes
-            hwnd = int(self.winId())
-            if not hwnd:
-                return
-            GWL_EXSTYLE      = -20
-            WS_EX_APPWINDOW  = 0x00040000
-            WS_EX_TOOLWINDOW = 0x00000080
-            cur = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            new = (cur | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
-            if new != cur:
-                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, new)
-                # SWP_NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
-                ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0037)
-        except Exception:
-            pass
+        if self._main_px and not self._main_px.isNull():
+            composed = compose_pip_frame(
+                self._main_px, sz, self._pip_px,
+                self._pip_size_pct, self._pip_margin, self._pip_rounded)
+            self.screen_lbl.setPixmap(composed)
+        elif self._pip_px and not self._pip_px.isNull():
+            # Standby preview with Camera PIP active
+            composed = compose_pip_frame(
+                QPixmap(), sz, self._pip_px,
+                self._pip_size_pct, self._pip_margin, self._pip_rounded)
+            self.screen_lbl.setPixmap(composed)
+        else:
+            self.screen_lbl.setPixmap(QPixmap())
+            self.screen_lbl.setText("Select a pad and click Project (Ctrl+P)")
 
-    def push(self, px: QPixmap):
-        if self._stack.currentIndex() == 0:
-            self._stack.setCurrentIndex(1)
-        sc = px.scaled(self._lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._lbl.setPixmap(sc)
-
-    def closeEvent(self, e):
-        self.closed.emit()
-        super().closeEvent(e)
-
-    def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape:
-            self.hide()
-        super().keyPressEvent(e)
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._render()
 
 # ── display picker dialog ──────────────────────────────────────────────────────
 
@@ -4503,30 +4989,57 @@ QStatusBar{{
   background:{C_SURFACE};color:{C_DIM};
   border-top:1px solid {C_BORDER};font-size:11px
 }}
+QLabel{{color:{C_TEXT}}}
+QComboBox{{
+  background:{C_SURFACE2};border:1px solid {C_BORDER};
+  border-radius:6px;color:{C_TEXT};padding:4px 10px;font-size:11px
+}}
+QComboBox::drop-down{{border:none}}
+QComboBox QAbstractItemView{{
+  background:{C_SURFACE2};border:1px solid {C_BORDER};
+  color:{C_TEXT};selection-background-color:{C_HOVER}
+}}
 QPushButton{{
   background:{C_SURFACE2};border:1px solid {C_BORDER};
-  border-radius:6px;color:{C_TEXT};padding:6px 14px;font-size:12px
+  border-radius:6px;color:{C_TEXT};padding:6px 12px;font-size:11px
 }}
 QPushButton:hover{{background:{C_HOVER};border-color:{C_ACCENT}}}
+QPushButton:disabled{{color:{C_DIM};border-color:{C_BORDER};background:{C_SURFACE}}}
 QPushButton#Project{{
-  background:{C_ACCENT};border:none;color:#FFFFFF;font-weight:600
+  background:{C_ACCENT};border:none;color:#FFFFFF;font-weight:700;font-size:13px
 }}
-QPushButton#Project:hover{{background:#333333}}
+QPushButton#Project:hover{{background:#0070E0}}
+QPushButton#Project:disabled{{background:{C_SURFACE2};color:{C_DIM}}}
 QPushButton#Stop{{
-  background:{C_DANGER};border:none;color:#FFFFFF;font-weight:600
+  background:{C_DANGER};border:none;color:#FFFFFF;font-weight:700;font-size:12px
 }}
-QPushButton#Stop:hover{{background:#CC2A20}}
+QPushButton#Stop:hover{{background:#E0352B}}
+QPushButton#Stop:disabled{{background:{C_SURFACE2};color:{C_DIM}}}
+QPushButton#PipToggleOff{{
+  background:{C_SURFACE2};border:1px solid {C_CAMERA}66;
+  color:{C_CAMERA};font-weight:600
+}}
+QPushButton#PipToggleOff:hover{{background:#1B3322}}
+QPushButton#PipToggleOn{{
+  background:{C_CAMERA};border:none;color:#0A0A0C;font-weight:700
+}}
+QPushButton#PipToggleOn:hover{{background:#28B84C}}
 QPushButton#WebcamStop{{
-  background:{C_WEBCAM};border:none;color:#1C1C1E;font-weight:600
+  background:{C_WEBCAM};border:none;color:#0A0A0C;font-weight:600
 }}
 QPushButton#WebcamStop:hover{{background:#E08800}}
-QPushButton#VirtStopAll{{
-  background:#1E3A26;border:1px solid {C_VIRTUAL};color:{C_VIRTUAL};font-weight:600
-}}
-QPushButton#VirtStopAll:hover{{background:#1A4A2A}}
-QPushButton#VirtStopAll:disabled{{border-color:#333;color:#555}}
+QPushButton#WebcamStop:disabled{{background:{C_SURFACE2};color:{C_DIM}}}
 #Header{{background:{C_SURFACE};border-bottom:1px solid {C_BORDER}}}
-#Controls{{background:{C_SURFACE};border-top:1px solid {C_BORDER}}}
+#ProgramMonitor{{
+  background:#0A0A0C;border:1px solid {C_BORDER};border-radius:8px
+}}
+#ProgBar{{
+  background:{C_SURFACE};border-bottom:1px solid {C_BORDER};
+  border-top-left-radius:8px;border-top-right-radius:8px
+}}
+#SideCard{{
+  background:{C_SURFACE};border:1px solid {C_BORDER};border-radius:8px
+}}
 QSlider::groove:horizontal{{
   height:3px;background:{C_BORDER};border-radius:2px
 }}
@@ -4543,7 +5056,7 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME}  v{VERSION}")
-        self.setMinimumSize(820, 540)
+        self.setMinimumSize(940, 680)
         self.pads: List[PadConfig]  = [PadConfig(i) for i in range(MAX_PADS)]
         self.pad_widgets: List[PadWidget] = []
         self.selected: Optional[int]      = None
@@ -4553,13 +5066,14 @@ class Main(QMainWindow):
         self.worker:          Optional[CaptureThread]   = None
         self.proj_worker:     Optional[ProjectorThread] = None
         self.webcam_worker:   Optional[WebcamThread]    = None
-        self._virtual_windows: Dict[int, VirtualScreenWindow] = {}
-        self._virtual_threads: Dict[int, VirtualScreenThread] = {}
+        self.cam_worker:      Optional[CameraPipThread] = None
         self._proj_fps: int  = 60
         self._webcam_video_path: str = ""
         self._last_webcam_pad: int             = WEBCAM_PAD_VIDEO
         self._webcam_active_pad: Optional[int] = None
         self._quad_projecting: bool            = False
+        self._pip_active: bool                 = False
+        self._pip_frame: Optional[QPixmap]     = None
         AppConfig.load()
         self.setStyleSheet(_MAINSS)
         self._build()
@@ -4577,41 +5091,145 @@ class Main(QMainWindow):
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(0)
 
-        # Header
-        hdr = QWidget(); hdr.setObjectName("Header"); hdr.setFixedHeight(58)
-        hl  = QHBoxLayout(hdr); hl.setContentsMargins(20, 8, 20, 8)
+        # Compact Top Toolbar
+        hdr = QWidget(); hdr.setObjectName("Header"); hdr.setFixedHeight(52)
+        hl  = QHBoxLayout(hdr); hl.setContentsMargins(16, 6, 16, 6); hl.setSpacing(10)
 
-        tc = QVBoxLayout(); tc.setSpacing(1)
-        t  = QLabel("PROJECTION PAD")
-        t.setFont(QFont("Segoe UI,Inter,sans-serif", 16, QFont.Bold))
+        t = QLabel("PROJECTION PAD")
+        t.setFont(QFont("Segoe UI,Inter,sans-serif", 14, QFont.Bold))
         t.setStyleSheet(f"color:{C_TEXT};letter-spacing:1px;background:transparent")
-        sub = QLabel(f"Virtual Screen Manager  •  v{VERSION}")
-        sub.setStyleSheet(f"color:{C_DIM};font-size:10px;background:transparent")
-        tc.addWidget(t); tc.addWidget(sub)
+        ver_lbl = QLabel(f"v{VERSION}")
+        ver_lbl.setStyleSheet(
+            f"color:{C_DIM};font-size:10px;background:{C_SURFACE2};"
+            f"padding:2px 6px;border-radius:4px;")
 
-        self.di = QLabel("Detecting displays...")
-        self.di.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
-        self.di.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        out_lbl = QLabel("Output:")
+        out_lbl.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
+        self.out_disp_cb = QComboBox()
+        self.out_disp_cb.setMinimumWidth(190)
 
-        hl.addLayout(tc); hl.addStretch(); hl.addWidget(self.di)
+        self.disp_btn = QPushButton("Display")
+        self.disp_btn.clicked.connect(self._display_settings)
+
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh)
+
+        fps_lbl = QLabel("Preview:")
+        fps_lbl.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
+        self.fps_sl = QSlider(Qt.Horizontal)
+        self.fps_sl.setRange(1, 10); self.fps_sl.setValue(DEFAULT_FPS)
+        self.fps_sl.setFixedWidth(72)
+        self.fps_lbl2 = QLabel(f"{DEFAULT_FPS} fps")
+        self.fps_lbl2.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
+        self.fps_lbl2.setFixedWidth(36)
+        self.fps_sl.valueChanged.connect(self._fps_changed)
+
+        wcam_setup_btn = QPushButton("Webcam Setup")
+        wcam_setup_btn.clicked.connect(self._webcam_setup)
+
+        hl.addWidget(t)
+        hl.addWidget(ver_lbl)
+        hl.addStretch()
+        hl.addWidget(out_lbl)
+        hl.addWidget(self.out_disp_cb)
+        hl.addWidget(self.disp_btn)
+        hl.addWidget(refresh_btn)
+        hl.addWidget(fps_lbl)
+        hl.addWidget(self.fps_sl)
+        hl.addWidget(self.fps_lbl2)
+        hl.addWidget(wcam_setup_btn)
         vl.addWidget(hdr)
 
-        # Deck body — Stream Deck White chassis aesthetic: light body, dark keys
+        # Studio Section: Program Monitor (left) + Quick Control Panel (right)
+        studio = QWidget()
+        studio.setStyleSheet(f"background:{C_BG};")
+        sl = QHBoxLayout(studio)
+        sl.setContentsMargins(16, 12, 16, 6)
+        sl.setSpacing(12)
+
+        self.prog_monitor = ProgramMonitor()
+        sl.addWidget(self.prog_monitor, 3)
+
+        # Right Quick Control Panel
+        panel = QWidget()
+        panel.setFixedWidth(236)
+        pl = QVBoxLayout(panel)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(10)
+
+        # Primary Projection Card
+        proj_card = QFrame(); proj_card.setObjectName("SideCard")
+        pcl = QVBoxLayout(proj_card); pcl.setContentsMargins(12, 10, 12, 10); pcl.setSpacing(8)
+        pc_hdr = QLabel("PROGRAM OUTPUT")
+        pc_hdr.setStyleSheet(f"color:{C_DIM};font-size:10px;font-weight:700;background:transparent")
+        self.proj_btn = QPushButton("PROJECT")
+        self.proj_btn.setObjectName("Project")
+        self.proj_btn.setFixedHeight(38)
+        self.proj_btn.setEnabled(False)
+        self.proj_btn.clicked.connect(self._project)
+
+        self.stop_btn = QPushButton("STOP PROJECTION")
+        self.stop_btn.setObjectName("Stop")
+        self.stop_btn.setFixedHeight(32)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop)
+        pcl.addWidget(pc_hdr)
+        pcl.addWidget(self.proj_btn)
+        pcl.addWidget(self.stop_btn)
+        pl.addWidget(proj_card)
+
+        # Camera PIP Card (Pad 6)
+        pip_card = QFrame(); pip_card.setObjectName("SideCard")
+        pil = QVBoxLayout(pip_card); pil.setContentsMargins(12, 10, 12, 10); pil.setSpacing(8)
+        pip_hdr = QLabel("CAMERA PIP  •  LOWER RIGHT")
+        pip_hdr.setStyleSheet(f"color:{C_DIM};font-size:10px;font-weight:700;background:transparent")
+        pip_row = QHBoxLayout(); pip_row.setSpacing(6)
+        self.pip_toggle_btn = QPushButton("PIP: OFF")
+        self.pip_toggle_btn.setObjectName("PipToggleOff")
+        self.pip_toggle_btn.setFixedHeight(32)
+        self.pip_toggle_btn.clicked.connect(self._toggle_camera_pip)
+        pip_cfg_btn = QPushButton("⚙")
+        pip_cfg_btn.setFixedSize(32, 32)
+        pip_cfg_btn.setToolTip("Camera & PIP Settings")
+        pip_cfg_btn.clicked.connect(lambda: self._configure(CAMERA_PIP_PAD))
+        pip_row.addWidget(self.pip_toggle_btn, 1)
+        pip_row.addWidget(pip_cfg_btn)
+        pil.addWidget(pip_hdr)
+        pil.addLayout(pip_row)
+        pl.addWidget(pip_card)
+
+        # Virtual Webcam Card (Pad 8)
+        wcam_card = QFrame(); wcam_card.setObjectName("SideCard")
+        wcl = QVBoxLayout(wcam_card); wcl.setContentsMargins(12, 10, 12, 10); wcl.setSpacing(8)
+        wc_hdr = QLabel("VIRTUAL WEBCAM  •  PAD 8")
+        wc_hdr.setStyleSheet(f"color:{C_DIM};font-size:10px;font-weight:700;background:transparent")
+        self.wcam_stop_btn = QPushButton("Stop Webcam")
+        self.wcam_stop_btn.setObjectName("WebcamStop")
+        self.wcam_stop_btn.setFixedHeight(30)
+        self.wcam_stop_btn.setEnabled(False)
+        self.wcam_stop_btn.clicked.connect(self._stop_webcam)
+        wcl.addWidget(wc_hdr)
+        wcl.addWidget(self.wcam_stop_btn)
+        pl.addWidget(wcam_card)
+
+        pl.addStretch()
+        sl.addWidget(panel)
+        vl.addWidget(studio, 4)
+
+        # Deck body — 4×2 responsive pad grid
         deck = QWidget()
         deck.setObjectName("Deck")
-        deck.setStyleSheet(
-            f"QWidget#Deck{{background:{C_BG};}}"
-        )
+        deck.setStyleSheet(f"QWidget#Deck{{background:{C_BG};}}")
         gl = QGridLayout(deck)
-        gl.setContentsMargins(20, 20, 20, 20)
-        gl.setSpacing(12)
+        gl.setContentsMargins(16, 6, 16, 12)
+        gl.setSpacing(10)
         for i in range(MAX_PADS):
             pw = PadWidget(self.pads[i])
             pw.clicked.connect(self._pad_click)
             pw.configure.connect(self._configure)
             self.pad_widgets.append(pw)
             gl.addWidget(pw, i // PAD_COLS, i % PAD_COLS)
-        vl.addWidget(deck, 1)
+        vl.addWidget(deck, 5)
 
         # Keyboard shortcuts
         for i in range(MAX_PADS):
@@ -4626,78 +5244,9 @@ class Main(QMainWindow):
         QShortcut(QKeySequence("Ctrl+D"),
                   self).activated.connect(self._display_settings)
 
-        # Controls bar — two rows
-        ctrl = QWidget(); ctrl.setObjectName("Controls"); ctrl.setFixedHeight(96)
-        cl   = QVBoxLayout(ctrl)
-        cl.setContentsMargins(20, 8, 20, 8); cl.setSpacing(6)
-
-        # Row 1: preview fps + display/projection controls
-        row1 = QHBoxLayout(); row1.setSpacing(10)
-
-        fps_lbl = QLabel("Preview:")
-        fps_lbl.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
-        self.fps_sl = QSlider(Qt.Horizontal)
-        self.fps_sl.setRange(1, 10); self.fps_sl.setValue(DEFAULT_FPS)
-        self.fps_sl.setFixedWidth(90)
-        self.fps_lbl2 = QLabel(f"{DEFAULT_FPS} fps")
-        self.fps_lbl2.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
-        self.fps_lbl2.setFixedWidth(38)
-        self.fps_sl.valueChanged.connect(self._fps_changed)
-
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self._refresh)
-
-        self.proj_btn = QPushButton("Project")
-        self.proj_btn.setObjectName("Project")
-        self.proj_btn.setEnabled(False)
-        self.proj_btn.clicked.connect(self._project)
-
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.setObjectName("Stop")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop)
-
-        self.wcam_stop_btn = QPushButton("Stop Webcam")
-        self.wcam_stop_btn.setObjectName("WebcamStop")
-        self.wcam_stop_btn.setEnabled(False)
-        self.wcam_stop_btn.clicked.connect(self._stop_webcam)
-
-        wcam_setup_btn = QPushButton("Webcam Setup")
-        wcam_setup_btn.clicked.connect(self._webcam_setup)
-
-        row1.addWidget(fps_lbl); row1.addWidget(self.fps_sl); row1.addWidget(self.fps_lbl2)
-        row1.addStretch()
-        self.disp_btn = QPushButton("Display")
-        self.disp_btn.clicked.connect(self._display_settings)
-        row1.addWidget(self.disp_btn)
-        row1.addWidget(refresh_btn)
-        row1.addWidget(wcam_setup_btn)
-        row1.addWidget(self.proj_btn)
-        row1.addWidget(self.stop_btn)
-        row1.addWidget(self.wcam_stop_btn)
-
-        # Row 2: virtual screen controls
-        row2 = QHBoxLayout(); row2.setSpacing(10)
-
-        virt_lbl = QLabel("Virtual Screens (Pad 5 & 6):  click pad to start / stop")
-        virt_lbl.setStyleSheet(f"color:{C_DIM};font-size:11px;background:transparent")
-
-        self.virt_stop_all_btn = QPushButton("Stop All Virtual Screens")
-        self.virt_stop_all_btn.setObjectName("VirtStopAll")
-        self.virt_stop_all_btn.setEnabled(False)
-        self.virt_stop_all_btn.clicked.connect(self._stop_all_virtual_screens)
-
-        row2.addWidget(virt_lbl)
-        row2.addStretch()
-        row2.addWidget(self.virt_stop_all_btn)
-
-        cl.addLayout(row1)
-        cl.addLayout(row2)
-        vl.addWidget(ctrl)
-
         self.statusBar().showMessage(
-            "Ready — Ctrl+1–4 select pad  •  Ctrl+5/6 virtual screen  "
-            "•  Ctrl+7 Quad  •  Ctrl+8 Webcam  •  Ctrl+P project  •  Ctrl+R refresh")
+            "Ready — Ctrl+1–4 Screens/Windows  •  Ctrl+5 Image/Video  "
+            "•  Ctrl+6 Camera PIP  •  Ctrl+7 Quad  •  Ctrl+8 Virtual Webcam  •  Ctrl+P Project")
 
         self._src_timer = QTimer()
         self._src_timer.setInterval(10_000)
@@ -4706,16 +5255,42 @@ class Main(QMainWindow):
 
     # ── logic ──────────────────────────────────────────────────────────────────
 
+    def _pip_settings(self) -> tuple:
+        return (
+            int(AppConfig.get("pip_size_pct", 25)),
+            int(AppConfig.get("pip_margin", 24)),
+            bool(AppConfig.get("pip_rounded", True)),
+        )
+
     def _refresh(self):
         self.screens = Bridge.screens()
         self.windows = Bridge.windows()
         if self.worker:
             self.worker.set_sources(self.screens, self.windows)
-        for idx, thr in self._virtual_threads.items():
-            if thr.isRunning():
-                thr.set_source(self.pads[idx], self.screens, self.windows)
         ext_list = Bridge.external_screens()
         ext = ext_list[0] if ext_list else None
+
+        # Update Output Display dropdown preserving selection
+        prev_data = self.out_disp_cb.currentData()
+        self.out_disp_cb.blockSignals(True)
+        self.out_disp_cb.clear()
+        if ext_list:
+            for s in ext_list:
+                self.out_disp_cb.addItem(
+                    f"{s.name} ({s.bounds[2]}×{s.bounds[3]})", [s.index])
+            if len(ext_list) > 1:
+                self.out_disp_cb.addItem(
+                    f"All External ({len(ext_list)})", [s.index for s in ext_list])
+        elif self.screens:
+            s0 = self.screens[0]
+            self.out_disp_cb.addItem(
+                f"Primary Preview ({s0.bounds[2]}×{s0.bounds[3]})", [s0.index])
+        if prev_data is not None:
+            idx = self.out_disp_cb.findData(prev_data)
+            if idx >= 0:
+                self.out_disp_cb.setCurrentIndex(idx)
+        self.out_disp_cb.blockSignals(False)
+
         if ext:
             qt_screens = QApplication.screens()
             if ext.index < len(qt_screens):
@@ -4723,14 +5298,8 @@ class Main(QMainWindow):
             if self.proj_worker and self.proj_worker.isRunning():
                 self.proj_worker.update_sources(self.screens, self.windows)
                 self.proj_worker.set_fps(self._proj_fps)
-            ext_names = ", ".join(s.name for s in ext_list)
-            self.di.setText(
-                f"  {len(self.screens)} displays  "
-                f"External: {ext_names}  {self._proj_fps} Hz")
         else:
             self._proj_fps = 60
-            self.di.setText(
-                f"  {len(self.screens)} display(s) — no external detected")
         self.statusBar().showMessage(
             f"Sources refreshed — {len(self.windows)} windows, "
             f"{len(self.screens)} screens")
@@ -4755,7 +5324,6 @@ class Main(QMainWindow):
                       "no camera registered" in msg.lower() or
                       "not installed" in msg.lower())
         if no_backend:
-            # Auto-install the built-in Unity Capture driver
             reply = QMessageBox.question(
                 self, "Virtual Camera Driver Required",
                 "No virtual camera driver is installed.\n\n"
@@ -4780,13 +5348,8 @@ class Main(QMainWindow):
         WebcamSetupDialog(self).exec_()
 
     def _pad_click(self, idx: int):
-        if idx in VIRTUAL_PADS:
-            if idx in self._virtual_threads:
-                self._stop_virtual_screen(idx)
-            elif self.pads[idx].stype != SourceType.EMPTY:
-                self._start_virtual_screen(idx)
-            else:
-                self._configure(idx)
+        if idx == CAMERA_PIP_PAD:
+            self._toggle_camera_pip()
             return
         if idx == QUAD_PAD:
             self._start_quad_projection()
@@ -4797,18 +5360,29 @@ class Main(QMainWindow):
         cfg = self.pads[idx]
         if cfg.stype == SourceType.EMPTY:
             self._configure(idx)
-            return
+            if cfg.stype == SourceType.EMPTY:
+                return
         self.selected = idx
         for i, pw in enumerate(self.pad_widgets):
-            pw.set_state(projected=self.pads[i].projected, selected=(i == idx))
+            if i == CAMERA_PIP_PAD:
+                pw.set_state(webcam=self._pip_active)
+            elif i == WEBCAM_PAD_VIDEO:
+                pw.set_state(webcam=(self._webcam_active_pad == WEBCAM_PAD_VIDEO))
+            else:
+                pw.set_state(projected=self.pads[i].projected, selected=(i == idx))
         self.proj_btn.setEnabled(True)
         self.statusBar().showMessage(
-            f"Selected: {cfg.display_name} — click Project to send to HDMI")
+            f"Selected: {cfg.display_name} — click Project to send to screen")
         if any(p.isVisible() for p in self.projectors):
             self._project()
 
     def _pick_displays(self) -> Optional[List[ScreenInfo]]:
         ext = Bridge.external_screens()
+        sel_indices = self.out_disp_cb.currentData()
+        if ext and sel_indices:
+            chosen = [s for s in self.screens if s.index in sel_indices]
+            if chosen:
+                return chosen
         if not ext:
             r = QMessageBox.question(
                 self, "No External Display",
@@ -4833,34 +5407,45 @@ class Main(QMainWindow):
         if not targets:
             return
 
-        # Close projectors not matching the new target list
         for p in self.projectors:
             p.hide()
         self.projectors = []
 
+        sz_pct, margin, rounded = self._pip_settings()
         for screen in targets:
             p = Projector()
             p.place(screen)
+            if self._pip_active and self._pip_frame:
+                p.set_pip(self._pip_frame, sz_pct, margin, rounded)
             p.showFullScreen()
             self.projectors.append(p)
 
+        self._quad_projecting = False
         for i, cfg in enumerate(self.pads):
             cfg.projected = (i == self.selected)
-            self.pad_widgets[i].set_state(
-                projected=cfg.projected, selected=(i == self.selected))
+            if i == CAMERA_PIP_PAD:
+                self.pad_widgets[i].set_state(webcam=self._pip_active)
+            elif i == WEBCAM_PAD_VIDEO:
+                self.pad_widgets[i].set_state(
+                    webcam=(self._webcam_active_pad == WEBCAM_PAD_VIDEO))
+            else:
+                self.pad_widgets[i].set_state(
+                    projected=cfg.projected, selected=(i == self.selected))
 
         pad = self.pads[self.selected]
         if self.proj_worker is None:
             self.proj_worker = ProjectorThread()
             self.proj_worker.frame.connect(self._on_proj_frame)
+            self.proj_worker.error.connect(self._on_proj_error)
         self.proj_worker.set_target(pad, self.screens, self.windows)
         self.proj_worker.set_fps(self._proj_fps)
         if not self.proj_worker.isRunning():
             self.proj_worker.start()
 
-        self.proj_btn.setText("Projecting...")
+        self.proj_btn.setText("PROJECTING...")
         self.stop_btn.setEnabled(True)
         disp = ", ".join(s.name for s in targets)
+        self.prog_monitor.set_status(True, pad.display_name, disp)
         self.statusBar().showMessage(
             f"Projecting: {pad.display_name}  →  {disp}  {self._proj_fps} fps")
 
@@ -4875,17 +5460,22 @@ class Main(QMainWindow):
         self._quad_projecting = False
         for i, cfg in enumerate(self.pads):
             cfg.projected = False
-            self.pad_widgets[i].set_state(selected=(i == self.selected))
-        self.proj_btn.setText("Project")
+            if i == CAMERA_PIP_PAD:
+                self.pad_widgets[i].set_state(webcam=self._pip_active)
+            elif i == WEBCAM_PAD_VIDEO:
+                self.pad_widgets[i].set_state(
+                    webcam=(self._webcam_active_pad == WEBCAM_PAD_VIDEO))
+            else:
+                self.pad_widgets[i].set_state(selected=(i == self.selected))
+        self.proj_btn.setText("PROJECT")
         self.stop_btn.setEnabled(False)
+        self.prog_monitor.set_status(False)
         self.statusBar().showMessage("Projection stopped")
 
     def _start_quad_projection(self):
-        # Toggle: if already quad-projecting, stop
         if self._quad_projecting:
             self._stop()
             return
-        # Collect the first 4 configured pads (indices 0-3)
         quad_pads = [self.pads[i] for i in range(4)]
         if all(p.stype == SourceType.EMPTY for p in quad_pads):
             QMessageBox.information(
@@ -4895,94 +5485,114 @@ class Main(QMainWindow):
         targets = self._pick_displays()
         if not targets:
             return
-        # Stop any existing single projection
         self._stop()
         self._quad_projecting = True
+        sz_pct, margin, rounded = self._pip_settings()
         for screen in targets:
             p = Projector()
             p.place(screen)
+            if self._pip_active and self._pip_frame:
+                p.set_pip(self._pip_frame, sz_pct, margin, rounded)
             p.showFullScreen()
             self.projectors.append(p)
         if self.proj_worker is None:
             self.proj_worker = ProjectorThread()
             self.proj_worker.frame.connect(self._on_proj_frame)
+            self.proj_worker.error.connect(self._on_proj_error)
         self.proj_worker.set_quad_mode(quad_pads, self.screens, self.windows)
         self.proj_worker.set_fps(self._proj_fps)
         if not self.proj_worker.isRunning():
             self.proj_worker.start()
         self.pad_widgets[QUAD_PAD].set_state(projected=True)
         self.stop_btn.setEnabled(True)
-        self.proj_btn.setText("Projecting...")
+        self.proj_btn.setText("PROJECTING...")
         disp = ", ".join(s.name for s in targets)
+        self.prog_monitor.set_status(True, "Quad View — Pads 1–4", disp)
         self.statusBar().showMessage(
             f"Quad projecting Pads 1–4  →  {disp}  {self._proj_fps} fps")
 
-    def _start_virtual_screen(self, idx: int):
-        cfg = self.pads[idx]
-        if cfg.stype == SourceType.EMPTY:
-            self._configure(idx)
-            if cfg.stype == SourceType.EMPTY:
-                return
-        self._stop_virtual_screen(idx)
-        num = VIRTUAL_PADS.index(idx) + 1
-        win = VirtualScreenWindow(num)
-        win.closed.connect(lambda i=idx: self._stop_virtual_screen(i))
-        win.show()
-        self._virtual_windows[idx] = win
-        thr = VirtualScreenThread()
-        thr.set_source(cfg, self.screens, self.windows)
-        thr.frame.connect(lambda px, i=idx: self._on_virtual_frame(i, px))
-        thr.stopped.connect(lambda i=idx: self._stop_virtual_screen(i))
-        thr.start()
-        self._virtual_threads[idx] = thr
-        self.pad_widgets[idx].set_state(projected=True)
-        self.virt_stop_all_btn.setEnabled(True)
-        self.statusBar().showMessage(
-            f"Virtual screen {num} open — in Zoom: Share Screen → "
-            f"Advanced → 'Window' — select 'Projection Pad — Meeting Screen {num}'")
+    # ── Camera PIP (Pad 6) ────────────────────────────────────────────────────
 
-    def _stop_virtual_screen(self, idx: int):
-        thr = self._virtual_threads.pop(idx, None)
-        if thr:
+    def _toggle_camera_pip(self):
+        if self._pip_active:
+            self._stop_camera_pip()
+        else:
+            self._start_camera_pip()
+
+    def _start_camera_pip(self):
+        self._stop_camera_pip()
+        cam_idx = int(AppConfig.get("pip_cam_index", 0))
+        res_str = str(AppConfig.get("pip_res", "1280x720"))
+        try:
+            w_str, h_str = res_str.split("x")
+            cw, ch = int(w_str), int(h_str)
+        except Exception:
+            cw, ch = 1280, 720
+        mirror = bool(AppConfig.get("pip_mirror", False))
+
+        self.cam_worker = CameraPipThread(cam_idx, cw, ch, mirror)
+        self.cam_worker.frame.connect(self._on_cam_pip_frame)
+        self.cam_worker.error.connect(self._on_cam_pip_error)
+        self.cam_worker.stopped.connect(self._on_cam_pip_stopped)
+        self.cam_worker.start()
+
+        self._pip_active = True
+        self.pad_widgets[CAMERA_PIP_PAD].set_state(webcam=True)
+        self.pad_widgets[CAMERA_PIP_PAD].name.setText(f"Camera {cam_idx} (ON)")
+        self.pip_toggle_btn.setText("PIP: ON")
+        self.pip_toggle_btn.setObjectName("PipToggleOn")
+        self.pip_toggle_btn.style().unpolish(self.pip_toggle_btn)
+        self.pip_toggle_btn.style().polish(self.pip_toggle_btn)
+        self.statusBar().showMessage(f"Camera PIP ON (Camera {cam_idx}) — lower right")
+
+    def _stop_camera_pip(self):
+        if self.cam_worker:
             try:
-                thr.stopped.disconnect()
+                self.cam_worker.stopped.disconnect()
             except Exception:
                 pass
-            thr.stop()
-            thr.wait(2000)
-        win = self._virtual_windows.pop(idx, None)
-        if win:
-            try:
-                win.closed.disconnect()
-            except Exception:
-                pass
-            win.close()
-        self.pad_widgets[idx].set_state(projected=False)
-        cfg = self.pads[idx]
-        if cfg.stype == SourceType.EMPTY:
-            self.pad_widgets[idx]._placeholder()
-        self.virt_stop_all_btn.setEnabled(bool(self._virtual_threads))
-        num = VIRTUAL_PADS.index(idx) + 1
-        self.statusBar().showMessage(f"Virtual screen {num} stopped")
+            self.cam_worker.stop()
+            self.cam_worker.wait(2000)
+            self.cam_worker = None
+        self._pip_active = False
+        self._pip_frame = None
+        self.pad_widgets[CAMERA_PIP_PAD].set_state(webcam=False)
+        self.pad_widgets[CAMERA_PIP_PAD].name.setText("Camera PIP")
+        self.pad_widgets[CAMERA_PIP_PAD]._placeholder()
+        self.pip_toggle_btn.setText("PIP: OFF")
+        self.pip_toggle_btn.setObjectName("PipToggleOff")
+        self.pip_toggle_btn.style().unpolish(self.pip_toggle_btn)
+        self.pip_toggle_btn.style().polish(self.pip_toggle_btn)
+        self.prog_monitor.set_pip(None)
+        for p in self.projectors:
+            p.set_pip(None)
+        self.statusBar().showMessage("Camera PIP OFF")
 
-    def _stop_all_virtual_screens(self):
-        for idx in list(VIRTUAL_PADS):
-            self._stop_virtual_screen(idx)
+    def _on_cam_pip_stopped(self):
+        if self._pip_active:
+            self._stop_camera_pip()
 
-    def _on_virtual_frame(self, idx: int, px: QPixmap):
-        win = self._virtual_windows.get(idx)
-        if win and win.isVisible():
-            win.push(px)
-        self.pad_widgets[idx].set_frame(px)
+    def _on_cam_pip_frame(self, px: QPixmap):
+        self._pip_frame = px
+        self.pad_widgets[CAMERA_PIP_PAD].set_frame(px)
+        sz_pct, margin, rounded = self._pip_settings()
+        self.prog_monitor.set_pip(px, sz_pct, margin, rounded)
+        for p in self.projectors:
+            if p.isVisible():
+                p.set_pip(px, sz_pct, margin, rounded)
+
+    def _on_cam_pip_error(self, msg: str):
+        self._stop_camera_pip()
+        QMessageBox.warning(self, "Camera PIP Error", msg)
+
+    # ── Virtual Webcam (Pad 8) ────────────────────────────────────────────────
 
     def _start_webcam_video(self):
         self._last_webcam_pad = WEBCAM_PAD_VIDEO
-        # Toggle: if already running, stop it
         if (self.webcam_worker and self.webcam_worker.isRunning()
                 and self._webcam_active_pad == WEBCAM_PAD_VIDEO):
             self._stop_webcam()
             return
-        # Let user pick video file or screen/window
         picker = WebcamSourceDialog(self)
         if picker.exec_() != QDialog.Accepted:
             return
@@ -5026,12 +5636,20 @@ class Main(QMainWindow):
 
     def _configure(self, idx: int):
         cfg = self.pads[idx]
-        if idx in VIRTUAL_PADS:
-            dlg = ConfigDialog(cfg, self.windows, self.screens, self)
-            if dlg.exec_() == QDialog.Accepted and cfg.stype != SourceType.EMPTY:
+        if idx == MEDIA_PAD:
+            dlg = MediaConfigDialog(cfg, self)
+            if dlg.exec_() == QDialog.Accepted:
                 self.pad_widgets[idx].update_cfg(cfg)
+                self._refresh_media_thumbnail(cfg)
                 self.statusBar().showMessage(
-                    f"Pad {idx + 1} (Meeting Virtual Screen) configured: {cfg.sname}")
+                    f"Pad 5 (Media) configured: {cfg.sname}")
+            return
+        if idx == CAMERA_PIP_PAD:
+            dlg = CameraPipConfigDialog(self)
+            if dlg.exec_() == QDialog.Accepted:
+                if self._pip_active:
+                    self._start_camera_pip()
+                self.statusBar().showMessage("Camera PIP settings saved")
             return
         if idx == WEBCAM_PAD_VIDEO:
             picker = WebcamSourceDialog(self)
@@ -5059,6 +5677,21 @@ class Main(QMainWindow):
             self.statusBar().showMessage(
                 f"Pad {idx + 1} configured: {cfg.sname}")
 
+    def _refresh_media_thumbnail(self, cfg: PadConfig):
+        if cfg.stype == SourceType.IMAGE and cfg.sid:
+            px = QPixmap(cfg.sid)
+            if not px.isNull():
+                self.pad_widgets[cfg.index].set_frame(px)
+        elif cfg.stype == SourceType.VIDEO and cfg.sid and HAS_CV2:
+            cap = cv2.VideoCapture(cfg.sid)
+            ret, frame = cap.read()
+            cap.release()
+            if ret and frame is not None:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, _ = rgb.shape
+                qi = QImage(rgb.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+                self.pad_widgets[cfg.index].set_frame(QPixmap.fromImage(qi))
+
     def _fps_changed(self, v: int):
         self.fps_lbl2.setText(f"{v} fps")
         if self.worker:
@@ -5082,9 +5715,17 @@ class Main(QMainWindow):
     def _on_proj_frame(self, px: QPixmap):
         name = ("Quad View — Pads 1–4" if self._quad_projecting else
                 self.pads[self.selected].display_name if self.selected is not None else "")
+        self.prog_monitor.push(px)
+        if (not self._quad_projecting and self.selected == MEDIA_PAD
+                and self.pads[MEDIA_PAD].stype == SourceType.VIDEO):
+            self.pad_widgets[MEDIA_PAD].set_frame(px)
         for p in self.projectors:
             if p.isVisible():
                 p.push(px, name)
+
+    def _on_proj_error(self, msg: str):
+        self._stop()
+        QMessageBox.warning(self, "Projection Error", msg)
 
     def _display_settings(self):
         ext = Bridge.external_screen()
@@ -5093,16 +5734,14 @@ class Main(QMainWindow):
         self._refresh()
 
     def closeEvent(self, e):
-        all_threads = (list(self._virtual_threads.values())
-                       + [self.webcam_worker, self.proj_worker, self.worker])
+        all_threads = [self.cam_worker, self.webcam_worker,
+                       self.proj_worker, self.worker]
         for w in all_threads:
             if w:
                 w.stop()
         for w in all_threads:
             if w:
                 w.wait(2000)
-        for win in self._virtual_windows.values():
-            win.close()
         for p in self.projectors:
             p.close()
         super().closeEvent(e)
