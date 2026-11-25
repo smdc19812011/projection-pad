@@ -2942,41 +2942,48 @@ class Bridge:
         return wins
 
     @staticmethod
+    def _iter_tab_items(hwnd: int):
+        """Yield TabItemControl nodes for a browser window, skipping web DocumentControls."""
+        ctrl = auto.ControlFromHandle(hwnd)
+        if not ctrl:
+            return
+        queue = [(ctrl, 0)]
+        while queue:
+            node, depth = queue.pop(0)
+            if depth > 16:
+                continue
+            ct = node.ControlType
+            if ct == auto.ControlType.DocumentControl:
+                continue
+            if ct == auto.ControlType.TabItemControl:
+                yield node
+                continue
+            try:
+                for ch in node.GetChildren():
+                    queue.append((ch, depth + 1))
+            except Exception:
+                pass
+
+    @staticmethod
     def browser_tabs() -> List[tuple]:
         """Return list of (hwnd_str, tab_title, app_name) for open browser tabs."""
         if PLATFORM != "Windows" or not (HAS_WIN32 and HAS_UIA):
             return []
-        browser_exes = ("chrome.exe", "msedge.exe", "brave.exe",
-                        "opera.exe", "vivaldi.exe", "firefox.exe")
+        browser_apps = ("chrome", "msedge", "brave", "opera", "vivaldi", "firefox")
         tabs: List[tuple] = []
         wins = Bridge._wins_win32()
         for w in wins:
-            if w.app.lower() not in browser_exes:
+            if w.app.lower().replace(".exe", "") not in browser_apps:
                 continue
             try:
                 hwnd = int(w.id)
                 with auto.UIAutomationInitializerInThread():
-                    ctrl = auto.ControlFromHandle(hwnd)
-                    if not ctrl:
-                        continue
                     seen = set()
-                    # Walk shallowly for TabItemControl
-                    queue = [(ctrl, 0)]
-                    while queue:
-                        node, depth = queue.pop(0)
-                        if depth > 8:
-                            continue
-                        if node.ControlType == auto.ControlType.TabItemControl:
-                            name = (node.Name or "").strip()
-                            if name and name not in seen:
-                                seen.add(name)
-                                tabs.append((w.id, name, w.app))
-                            continue
-                        try:
-                            for ch in node.GetChildren():
-                                queue.append((ch, depth + 1))
-                        except Exception:
-                            pass
+                    for node in Bridge._iter_tab_items(hwnd):
+                        name = (node.Name or "").strip()
+                        if name and name not in seen:
+                            seen.add(name)
+                            tabs.append((w.id, name, w.app))
             except Exception:
                 pass
         return tabs
@@ -2989,37 +2996,23 @@ class Bridge:
         try:
             hwnd = int(hwnd_str)
             with auto.UIAutomationInitializerInThread():
-                ctrl = auto.ControlFromHandle(hwnd)
-                if not ctrl:
-                    return False
-                queue = [(ctrl, 0)]
-                while queue:
-                    node, depth = queue.pop(0)
-                    if depth > 8:
-                        continue
-                    if node.ControlType == auto.ControlType.TabItemControl:
-                        name = (node.Name or "").strip()
-                        if name == tab_title or tab_title in name:
-                            try:
-                                pat = node.GetSelectionItemPattern()
-                                if pat:
-                                    pat.Select()
-                                    return True
-                            except Exception:
-                                pass
-                            try:
-                                pat = node.GetInvokePattern()
-                                if pat:
-                                    pat.Invoke()
-                                    return True
-                            except Exception:
-                                pass
-                        continue
-                    try:
-                        for ch in node.GetChildren():
-                            queue.append((ch, depth + 1))
-                    except Exception:
-                        pass
+                for node in Bridge._iter_tab_items(hwnd):
+                    name = (node.Name or "").strip()
+                    if name == tab_title or tab_title in name:
+                        try:
+                            pat = node.GetSelectionItemPattern()
+                            if pat:
+                                pat.Select()
+                                return True
+                        except Exception:
+                            pass
+                        try:
+                            pat = node.GetInvokePattern()
+                            if pat:
+                                pat.Invoke()
+                                return True
+                        except Exception:
+                            pass
         except Exception:
             pass
         return False
