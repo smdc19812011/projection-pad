@@ -3779,6 +3779,7 @@ class PadWidget(QFrame):
         self._projected   = False
         self._selected    = False
         self._webcam_live = False
+        self._last_frame: Optional[QPixmap] = None
         self._setup()
 
     def set_screens(self, screens: List[ScreenInfo]):
@@ -3813,8 +3814,11 @@ class PadWidget(QFrame):
         self.dot.setObjectName("Dot")
         self.dot.setFixedWidth(10)
 
+        from PyQt5.QtWidgets import QSizePolicy
         self.name = QLabel(self._default_footer_name())
         self.name.setObjectName("Name")
+        self.name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.name.setMinimumWidth(0)
 
         self.sc_lbl = QLabel(f"Ctrl+{self.cfg.index + 1}")
         self.sc_lbl.setObjectName("ShortcutLbl")
@@ -3859,76 +3863,101 @@ class PadWidget(QFrame):
 
     def _placeholder(self):
         from PyQt5.QtCore import QRect
-        ph_h = PAD_H - 28   # 157 px
-        pm = QPixmap(PAD_W, ph_h)
+        self._last_frame = None
+        sz = self.preview.size()
+        w = sz.width() if sz.width() >= 40 else PAD_W
+        h = sz.height() if sz.height() >= 40 else (PAD_H - 28)
+        s = max(0.65, min(w / 185.0, h / 157.0))
+
+        pm = QPixmap(w, h)
         pm.fill(QColor(C_KEY_BG))
         p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        def fnt(pt: float, bold: bool = False) -> QFont:
+            return QFont("Segoe UI,Inter,sans-serif",
+                         max(7, round(pt * s)),
+                         QFont.Bold if bold else QFont.Normal)
+
+        cy = h // 2
 
         if self.cfg.index == MEDIA_PAD:
             p.setPen(QColor(C_MEDIA))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 18, QFont.Bold))
-            p.drawText(QRect(0, 14, PAD_W, 34), Qt.AlignCenter, "🖼  ▶")
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 12, QFont.Bold))
-            p.drawText(QRect(0, 56, PAD_W, 24), Qt.AlignCenter, "IMAGE /")
-            p.drawText(QRect(0, 80, PAD_W, 24), Qt.AlignCenter, "VIDEO")
+            p.setFont(fnt(16, True))
+            p.drawText(QRect(0, cy - round(52 * s), w, round(30 * s)),
+                       Qt.AlignCenter, "🖼  ▶")
+            p.setFont(fnt(11, True))
+            p.drawText(QRect(0, cy - round(16 * s), w, round(20 * s)),
+                       Qt.AlignCenter, "IMAGE /")
+            p.drawText(QRect(0, cy + round(4 * s), w, round(20 * s)),
+                       Qt.AlignCenter, "VIDEO")
             p.setPen(QColor(C_DIM_K))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(QRect(4, 122, PAD_W - 8, 20), Qt.AlignCenter,
-                       "click or ⚙ to select")
+            p.setFont(fnt(8))
+            p.drawText(QRect(4, cy + round(32 * s), w - 8, round(18 * s)),
+                       Qt.AlignCenter, "click or ⚙ to select")
 
         elif self.cfg.index == CAMERA_PIP_PAD:
             p.setPen(QColor(C_CAMERA))
             p.setBrush(QColor(C_CAMERA + "28"))
-            # Outer screen + lower-right PIP box icon
-            p.drawRoundedRect((PAD_W - 64) // 2, 16, 64, 42, 4, 4)
+            bw, bh = round(56 * s), round(36 * s)
+            bx, by = (w - bw) // 2, cy - round(48 * s)
+            p.drawRoundedRect(bx, by, bw, bh, 4, 4)
             p.setBrush(QColor(C_CAMERA))
-            p.drawRoundedRect((PAD_W - 64) // 2 + 36, 16 + 22, 24, 16, 2, 2)
+            pw, ph = round(20 * s), round(13 * s)
+            p.drawRoundedRect(bx + bw - pw - round(4 * s),
+                              by + bh - ph - round(4 * s), pw, ph, 2, 2)
             p.setBrush(Qt.NoBrush)
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 12, QFont.Bold))
-            p.drawText(QRect(0, 68, PAD_W, 24), Qt.AlignCenter, "CAMERA PIP")
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8, QFont.Bold))
-            p.drawText(QRect(0, 92, PAD_W, 18), Qt.AlignCenter, "LOWER RIGHT")
+            p.setFont(fnt(11, True))
+            p.drawText(QRect(0, cy - round(4 * s), w, round(22 * s)),
+                       Qt.AlignCenter, "CAMERA PIP")
+            p.setFont(fnt(8, True))
+            p.drawText(QRect(0, cy + round(16 * s), w, round(16 * s)),
+                       Qt.AlignCenter, "LOWER RIGHT")
             p.setPen(QColor(C_DIM_K))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(QRect(4, 124, PAD_W - 8, 20), Qt.AlignCenter,
-                       "click ON/OFF • ⚙ setup")
+            p.setFont(fnt(8))
+            p.drawText(QRect(4, cy + round(34 * s), w - 8, round(18 * s)),
+                       Qt.AlignCenter, "click ON/OFF • ⚙ setup")
 
         elif self.cfg.index == QUAD_PAD:
-            # 2×2 grid icon
             p.setPen(QColor(C_QUAD))
             p.setBrush(QColor(C_QUAD + "33"))
-            cell = 18
-            gap  = 4
+            cell = round(16 * s)
+            gap  = round(4 * s)
             gw   = cell * 2 + gap
-            sx   = (PAD_W - gw) // 2
-            sy   = 18
+            sx   = (w - gw) // 2
+            sy   = cy - round(48 * s)
             for r in range(2):
                 for c in range(2):
                     p.drawRect(sx + c * (cell + gap), sy + r * (cell + gap), cell, cell)
             p.setBrush(Qt.NoBrush)
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
-            p.drawText(QRect(0, 72, PAD_W, 26), Qt.AlignCenter, "QUAD")
-            p.drawText(QRect(0, 96, PAD_W, 22), Qt.AlignCenter, "PROJECT")
+            p.setFont(fnt(12, True))
+            p.drawText(QRect(0, cy - round(6 * s), w, round(22 * s)),
+                       Qt.AlignCenter, "QUAD")
+            p.drawText(QRect(0, cy + round(14 * s), w, round(20 * s)),
+                       Qt.AlignCenter, "PROJECT")
             p.setPen(QColor(C_DIM_K))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(QRect(4, 130, PAD_W - 8, 20), Qt.AlignCenter,
-                       "click to project Pads 1–4")
+            p.setFont(fnt(8))
+            p.drawText(QRect(4, cy + round(36 * s), w - 8, round(18 * s)),
+                       Qt.AlignCenter, "click to project Pads 1–4")
 
         elif self.cfg.index == WEBCAM_PAD_VIDEO:
             p.setPen(QColor(C_WEBCAM))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 18, QFont.Bold))
-            p.drawText(QRect(0, 12, PAD_W, 36), Qt.AlignCenter, "▶  🖥")
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 13, QFont.Bold))
-            p.drawText(QRect(0, 60, PAD_W, 26), Qt.AlignCenter, "WEBCAM")
-            p.drawText(QRect(0, 86, PAD_W, 26), Qt.AlignCenter, "OUTPUT")
+            p.setFont(fnt(16, True))
+            p.drawText(QRect(0, cy - round(52 * s), w, round(30 * s)),
+                       Qt.AlignCenter, "▶  🖥")
+            p.setFont(fnt(12, True))
+            p.drawText(QRect(0, cy - round(16 * s), w, round(22 * s)),
+                       Qt.AlignCenter, "WEBCAM")
+            p.drawText(QRect(0, cy + round(6 * s), w, round(22 * s)),
+                       Qt.AlignCenter, "OUTPUT")
             p.setPen(QColor(C_DIM_K))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 8))
-            p.drawText(QRect(4, 125, PAD_W - 8, 22), Qt.AlignCenter,
-                       "video or screen / window")
+            p.setFont(fnt(8))
+            p.drawText(QRect(4, cy + round(34 * s), w - 8, round(18 * s)),
+                       Qt.AlignCenter, "video or screen / window")
 
         else:
             p.setPen(QColor(C_DIM_K))
-            p.setFont(QFont("Segoe UI,Inter,sans-serif", 10))
+            p.setFont(fnt(10))
             p.drawText(pm.rect(), Qt.AlignCenter,
                        f"Pad {self.cfg.index + 1}\n⚙  to configure\nCtrl+{self.cfg.index + 1}")
 
@@ -3936,11 +3965,22 @@ class PadWidget(QFrame):
         self.preview.setPixmap(pm)
 
     def set_frame(self, px: QPixmap):
+        self._last_frame = px
         sz = self.preview.size()
         if sz.width() < 10 or sz.height() < 10:
             sz = QSize(PAD_W, PAD_H - 28)
         scaled = px.scaled(sz, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.preview.setPixmap(scaled)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if self._last_frame is not None and not self._last_frame.isNull():
+            sz = self.preview.size()
+            if sz.width() >= 10 and sz.height() >= 10:
+                self.preview.setPixmap(
+                    self._last_frame.scaled(sz, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self._placeholder()
 
     def set_state(self, projected: bool = False, selected: bool = False,
                   webcam: bool = False):
@@ -5576,6 +5616,10 @@ class Main(QMainWindow):
             pw.target_changed.connect(self._on_pad_target_changed)
             self.pad_widgets.append(pw)
             gl.addWidget(pw, i // PAD_COLS, i % PAD_COLS)
+        for col in range(PAD_COLS):
+            gl.setColumnStretch(col, 1)
+        for row in range((MAX_PADS + PAD_COLS - 1) // PAD_COLS):
+            gl.setRowStretch(row, 1)
         vl.addWidget(deck, 5)
 
         # Keyboard shortcuts
