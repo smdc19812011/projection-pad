@@ -2789,12 +2789,31 @@ class PadConfig:
     sname: str = "Empty"
     projected: bool = False
     loop: bool = True
+    target_screen: Optional[int] = None  # None=Global, -1=All External, >=0=screen index
 
     @property
     def display_name(self) -> str:
         if self.label:
             return self.label
         return f"Pad {self.index + 1}" if self.stype == SourceType.EMPTY else self.sname
+
+
+def populate_target_screen_combo(cb: QComboBox, screens: List[ScreenInfo],
+                                 current_target: Optional[int]):
+    """Fill a QComboBox with Global Default, individual external screens, and All External."""
+    cb.clear()
+    cb.addItem("Default (Global Output)", None)
+    ext = [s for s in screens if not s.primary]
+    for s in ext:
+        cb.addItem(
+            f"Display {s.index + 1}: {s.name} ({s.bounds[2]}×{s.bounds[3]})",
+            s.index)
+    if len(ext) > 1:
+        cb.addItem(f"All External ({len(ext)} monitors)", -1)
+    if current_target is not None:
+        idx = cb.findData(current_target)
+        if idx >= 0:
+            cb.setCurrentIndex(idx)
 
 # ── system bridge ──────────────────────────────────────────────────────────────
 
@@ -3572,16 +3591,21 @@ class WebcamThread(QThread):
 # ── pad widget ─────────────────────────────────────────────────────────────────
 
 class PadWidget(QFrame):
-    clicked   = pyqtSignal(int)
-    configure = pyqtSignal(int)
+    clicked        = pyqtSignal(int)
+    configure      = pyqtSignal(int)
+    target_changed = pyqtSignal(int, object)
 
     def __init__(self, cfg: PadConfig):
         super().__init__()
         self.cfg          = cfg
+        self._screens: List[ScreenInfo] = []
         self._projected   = False
         self._selected    = False
         self._webcam_live = False
         self._setup()
+
+    def set_screens(self, screens: List[ScreenInfo]):
+        self._screens = screens[:]
 
     def _setup(self):
         from PyQt5.QtWidgets import QSizePolicy
@@ -3640,14 +3664,21 @@ class PadWidget(QFrame):
 
     def _default_footer_name(self) -> str:
         if self.cfg.index == MEDIA_PAD and self.cfg.stype == SourceType.EMPTY:
-            return "Media (Image/Video)"
-        if self.cfg.index == CAMERA_PIP_PAD:
+            base = "Media (Image/Video)"
+        elif self.cfg.index == CAMERA_PIP_PAD:
             return self.cfg.label or "Camera PIP"
-        if self.cfg.index == QUAD_PAD:
-            return "Quad Project"
-        if self.cfg.index == WEBCAM_PAD_VIDEO and self.cfg.stype == SourceType.EMPTY:
+        elif self.cfg.index == QUAD_PAD:
+            base = "Quad Project"
+        elif self.cfg.index == WEBCAM_PAD_VIDEO and self.cfg.stype == SourceType.EMPTY:
             return "Virtual Webcam"
-        return self.cfg.display_name
+        else:
+            base = self.cfg.display_name
+        if self.cfg.index not in (CAMERA_PIP_PAD, WEBCAM_PAD_VIDEO):
+            if self.cfg.target_screen == -1:
+                return f"[ALL] {base}"
+            if self.cfg.target_screen is not None:
+                return f"[D{self.cfg.target_screen + 1}] {base}"
+        return base
 
     def _placeholder(self):
         from PyQt5.QtCore import QRect
@@ -3857,6 +3888,7 @@ QLabel#ShortcutLbl{{
         elif is_quad:
             a1 = m.addAction("GRID  Quad Project (Pads 1–4)")
             a1.triggered.connect(lambda: self.clicked.emit(self.cfg.index))
+            self._add_target_submenu(m)
         elif is_webcam:
             label = "CAM  Start Webcam Output"
             a1 = m.addAction(label)
@@ -3871,6 +3903,7 @@ QLabel#ShortcutLbl{{
             m.addSeparator()
             a2 = m.addAction("CONF  Select Image / Video...")
             a2.triggered.connect(lambda: self.configure.emit(self.cfg.index))
+            self._add_target_submenu(m)
             a3 = m.addAction("CLR   Clear Pad")
             a3.setEnabled(self.cfg.stype != SourceType.EMPTY)
             a3.triggered.connect(self._clear)
@@ -3881,16 +3914,46 @@ QLabel#ShortcutLbl{{
             m.addSeparator()
             a2 = m.addAction("CONF  Configure Source...")
             a2.triggered.connect(lambda: self.configure.emit(self.cfg.index))
+            self._add_target_submenu(m)
             a3 = m.addAction("CLR   Clear Pad")
             a3.setEnabled(self.cfg.stype != SourceType.EMPTY)
             a3.triggered.connect(self._clear)
         m.exec_(e.globalPos())
+
+    def _add_target_submenu(self, menu: QMenu):
+        sub = menu.addMenu("OUT   Output Monitor")
+        ext = [s for s in self._screens if not s.primary]
+
+        a_def = sub.addAction("Default (Global Output)")
+        a_def.setCheckable(True)
+        a_def.setChecked(self.cfg.target_screen is None)
+        a_def.triggered.connect(
+            lambda: self.target_changed.emit(self.cfg.index, None))
+
+        if ext:
+            sub.addSeparator()
+            for s in ext:
+                act = sub.addAction(
+                    f"Display {s.index + 1}: {s.name} ({s.bounds[2]}×{s.bounds[3]})")
+                act.setCheckable(True)
+                act.setChecked(self.cfg.target_screen == s.index)
+                act.triggered.connect(
+                    lambda _checked=False, idx=s.index:
+                        self.target_changed.emit(self.cfg.index, idx))
+            if len(ext) > 1:
+                sub.addSeparator()
+                a_all = sub.addAction(f"All External ({len(ext)} monitors)")
+                a_all.setCheckable(True)
+                a_all.setChecked(self.cfg.target_screen == -1)
+                a_all.triggered.connect(
+                    lambda: self.target_changed.emit(self.cfg.index, -1))
 
     def _clear(self):
         self.cfg.stype = SourceType.EMPTY
         self.cfg.sid   = None
         self.cfg.sname = "Empty"
         self.cfg.label = ""
+        self.cfg.target_screen = None
         self.update_cfg(self.cfg)
 
 # ── dialog stylesheet (dark broadcast theme) ──────────────────────────────────
@@ -4205,7 +4268,7 @@ class ConfigDialog(QDialog):
         self.screens = screens
         self.setWindowTitle(f"Configure Pad {cfg.index + 1}")
         self.setModal(True)
-        self.setFixedSize(420, 400)
+        self.setFixedSize(440, 445)
         self.setStyleSheet(_DLGSS)
         self._build()
 
@@ -4243,6 +4306,14 @@ class ConfigDialog(QDialog):
         sl.addWidget(ref)
         vl.addWidget(self.src_grp)
 
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output Monitor:"))
+        self.out_cb = QComboBox()
+        populate_target_screen_combo(
+            self.out_cb, self.screens, self.cfg.target_screen)
+        out_row.addWidget(self.out_cb, 1)
+        vl.addLayout(out_row)
+
         btns = QHBoxLayout()
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.reject)
@@ -4279,6 +4350,7 @@ class ConfigDialog(QDialog):
     def _apply(self):
         ti = self.type_cb.currentIndex()
         self.cfg.label = self.lbl_edit.text().strip()
+        self.cfg.target_screen = self.out_cb.currentData()
         if ti == 0:
             self.cfg.stype = SourceType.EMPTY
             self.cfg.sid   = None
@@ -4421,12 +4493,13 @@ class VideoWebcamConfigDialog(QDialog):
 # ── media config dialog (Pad 5: Image or Video) ────────────────────────────────
 
 class MediaConfigDialog(QDialog):
-    def __init__(self, cfg: PadConfig, parent=None):
+    def __init__(self, cfg: PadConfig, screens: List[ScreenInfo] = (), parent=None):
         super().__init__(parent)
         self.cfg = cfg
+        self.screens = list(screens)
         self.setWindowTitle(f"Media Source — Pad {cfg.index + 1}")
         self.setModal(True)
-        self.setFixedSize(500, 250)
+        self.setFixedSize(500, 290)
         self.setStyleSheet(_DLGSS)
         self._build()
 
@@ -4462,6 +4535,14 @@ class MediaConfigDialog(QDialog):
         self.loop_cb = QCheckBox("Loop video playback")
         self.loop_cb.setChecked(self.cfg.loop)
         vl.addWidget(self.loop_cb)
+
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output Monitor:"))
+        self.out_cb = QComboBox()
+        populate_target_screen_combo(
+            self.out_cb, self.screens, self.cfg.target_screen)
+        out_row.addWidget(self.out_cb, 1)
+        vl.addLayout(out_row)
 
         btns = QHBoxLayout()
         cancel = QPushButton("Cancel")
@@ -4513,6 +4594,7 @@ class MediaConfigDialog(QDialog):
         self.cfg.sname = os.path.basename(p)
         self.cfg.label = self.lbl_edit.text().strip()
         self.cfg.loop  = self.loop_cb.isChecked()
+        self.cfg.target_screen = self.out_cb.currentData()
         self.accept()
 
 # ── camera PIP config dialog (Pad 6) ───────────────────────────────────────────
@@ -4642,12 +4724,13 @@ class CameraPipConfigDialog(QDialog):
 # ── display settings dialog ────────────────────────────────────────────────────
 
 class DisplaySettingsDialog(QDialog):
-    def __init__(self, screen: Optional[ScreenInfo], parent=None):
+    def __init__(self, screens: List[ScreenInfo], parent=None):
         super().__init__(parent)
-        self._screen = screen
+        self._screens = [s for s in screens if not s.primary] or list(screens)
+        self._screen: Optional[ScreenInfo] = self._screens[0] if self._screens else None
         self.setWindowTitle("Display Settings")
         self.setModal(True)
-        self.setFixedSize(420, 300)
+        self.setFixedSize(440, 330)
         self.setStyleSheet(_DLGSS)
         self._modes: List[tuple] = []
         self._build()
@@ -4657,6 +4740,51 @@ class DisplaySettingsDialog(QDialog):
         vl.setSpacing(10)
         vl.setContentsMargins(16, 16, 16, 16)
 
+        r0 = QHBoxLayout()
+        lbl0 = QLabel("Display:"); lbl0.setFixedWidth(100)
+        self.disp_cb = QComboBox()
+        for s in self._screens:
+            tag = "Primary" if s.primary else "External"
+            self.disp_cb.addItem(
+                f"Display {s.index + 1} ({tag}): {s.name} ({s.bounds[2]}×{s.bounds[3]})",
+                s.index)
+        self.disp_cb.currentIndexChanged.connect(self._on_disp_changed)
+        r0.addWidget(lbl0); r0.addWidget(self.disp_cb, 1)
+        vl.addLayout(r0)
+
+        self.info_lbl = QLabel("")
+        self.info_lbl.setStyleSheet(
+            f"color:{C_DIM};font-size:11px;background:{C_SURFACE2};"
+            f"padding:8px;border-radius:4px;border:1px solid {C_BORDER}")
+        vl.addWidget(self.info_lbl)
+
+        r1 = QHBoxLayout()
+        lbl1 = QLabel("Resolution:"); lbl1.setFixedWidth(100)
+        self.res_cb = QComboBox()
+        self.res_cb.currentIndexChanged.connect(self._fill_hz)
+        r1.addWidget(lbl1); r1.addWidget(self.res_cb, 1)
+        vl.addLayout(r1)
+
+        r2 = QHBoxLayout()
+        lbl2 = QLabel("Refresh Rate:"); lbl2.setFixedWidth(100)
+        self.hz_cb = QComboBox()
+        r2.addWidget(lbl2); r2.addWidget(self.hz_cb, 1)
+        vl.addLayout(r2)
+
+        btns = QHBoxLayout()
+        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
+        self.ok_btn = QPushButton("Apply"); self.ok_btn.setObjectName("OK")
+        self.ok_btn.clicked.connect(self._apply)
+        btns.addStretch(); btns.addWidget(cancel); btns.addWidget(self.ok_btn)
+        vl.addStretch(); vl.addLayout(btns)
+        self._load_selected_screen()
+
+    def _on_disp_changed(self):
+        idx = self.disp_cb.currentData()
+        self._screen = next((s for s in self._screens if s.index == idx), None)
+        self._load_selected_screen()
+
+    def _load_selected_screen(self):
         if self._screen:
             cur = self._current_mode()
             if cur:
@@ -4667,45 +4795,23 @@ class DisplaySettingsDialog(QDialog):
                             f"{self._screen.bounds[2]}x{self._screen.bounds[3]}")
         else:
             info_txt = "No external display detected"
+        self.info_lbl.setText(info_txt)
 
-        info = QLabel(info_txt)
-        info.setStyleSheet(
-            f"color:{C_DIM};font-size:11px;background:{C_SURFACE2};"
-            f"padding:8px;border-radius:4px;border:1px solid {C_BORDER}")
-        vl.addWidget(info)
-
-        if self._screen and HAS_WIN32:
-            self._modes = self._enum_modes()
-
-        r1 = QHBoxLayout()
-        lbl1 = QLabel("Resolution:"); lbl1.setFixedWidth(100)
-        self.res_cb = QComboBox()
-        r1.addWidget(lbl1); r1.addWidget(self.res_cb, 1)
-        vl.addLayout(r1)
-
-        r2 = QHBoxLayout()
-        lbl2 = QLabel("Refresh Rate:"); lbl2.setFixedWidth(100)
-        self.hz_cb = QComboBox()
-        r2.addWidget(lbl2); r2.addWidget(self.hz_cb, 1)
-        vl.addLayout(r2)
-
+        self._modes = self._enum_modes() if (self._screen and HAS_WIN32) else []
         if self._modes:
+            self.res_cb.setEnabled(True)
+            self.hz_cb.setEnabled(True)
+            self.ok_btn.setEnabled(True)
             self._fill_res()
-            self.res_cb.currentIndexChanged.connect(self._fill_hz)
         else:
             reason = "Windows + pywin32 required" if not HAS_WIN32 else "no modes found"
+            self.res_cb.blockSignals(True); self.res_cb.clear()
             self.res_cb.addItem(f"({reason})")
-            self.hz_cb.addItem("—")
+            self.res_cb.blockSignals(False)
+            self.hz_cb.clear(); self.hz_cb.addItem("—")
             self.res_cb.setEnabled(False)
             self.hz_cb.setEnabled(False)
-
-        btns = QHBoxLayout()
-        cancel = QPushButton("Cancel"); cancel.clicked.connect(self.reject)
-        self.ok_btn = QPushButton("Apply"); self.ok_btn.setObjectName("OK")
-        self.ok_btn.setEnabled(bool(self._modes))
-        self.ok_btn.clicked.connect(self._apply)
-        btns.addStretch(); btns.addWidget(cancel); btns.addWidget(self.ok_btn)
-        vl.addStretch(); vl.addLayout(btns)
+            self.ok_btn.setEnabled(False)
 
     def _enum_modes(self) -> List[tuple]:
         if not (HAS_WIN32 and self._screen):
@@ -5089,11 +5195,13 @@ class Main(QMainWindow):
         self.pads: List[PadConfig]  = [PadConfig(i) for i in range(MAX_PADS)]
         self.pad_widgets: List[PadWidget] = []
         self.selected: Optional[int]      = None
-        self.projectors: List[Projector]           = []
-        self.screens: List[ScreenInfo]             = []
-        self.windows: List[WinInfo]                = []
+        self.projectors: Dict[int, Projector]       = {}
+        self.proj_workers: Dict[int, ProjectorThread] = {}
+        self._screen_pad: Dict[int, int]          = {}
+        self._program_screen_idx: Optional[int]   = None
+        self.screens: List[ScreenInfo]            = []
+        self.windows: List[WinInfo]               = []
         self.worker:          Optional[CaptureThread]   = None
-        self.proj_worker:     Optional[ProjectorThread] = None
         self.webcam_worker:   Optional[WebcamThread]    = None
         self.cam_worker:      Optional[CameraPipThread] = None
         self._proj_fps: int  = 60
@@ -5256,6 +5364,7 @@ class Main(QMainWindow):
             pw = PadWidget(self.pads[i])
             pw.clicked.connect(self._pad_click)
             pw.configure.connect(self._configure)
+            pw.target_changed.connect(self._on_pad_target_changed)
             self.pad_widgets.append(pw)
             gl.addWidget(pw, i // PAD_COLS, i % PAD_COLS)
         vl.addWidget(deck, 5)
@@ -5296,6 +5405,8 @@ class Main(QMainWindow):
         self.windows = Bridge.windows()
         if self.worker:
             self.worker.set_sources(self.screens, self.windows)
+        for pw in self.pad_widgets:
+            pw.set_screens(self.screens)
         ext_list = Bridge.external_screens()
         ext = ext_list[0] if ext_list else None
 
@@ -5306,10 +5417,12 @@ class Main(QMainWindow):
         if ext_list:
             for s in ext_list:
                 self.out_disp_cb.addItem(
-                    f"{s.name} ({s.bounds[2]}×{s.bounds[3]})", [s.index])
+                    f"Display {s.index + 1}: {s.name} ({s.bounds[2]}×{s.bounds[3]})",
+                    [s.index])
             if len(ext_list) > 1:
                 self.out_disp_cb.addItem(
-                    f"All External ({len(ext_list)})", [s.index for s in ext_list])
+                    f"All External ({len(ext_list)} monitors)",
+                    [s.index for s in ext_list])
         elif self.screens:
             s0 = self.screens[0]
             self.out_disp_cb.addItem(
@@ -5324,9 +5437,11 @@ class Main(QMainWindow):
             qt_screens = QApplication.screens()
             if ext.index < len(qt_screens):
                 self._proj_fps = round(qt_screens[ext.index].refreshRate())
-            if self.proj_worker and self.proj_worker.isRunning():
-                self.proj_worker.update_sources(self.screens, self.windows)
-                self.proj_worker.set_fps(self._proj_fps)
+            for s_idx, w in self.proj_workers.items():
+                if w.isRunning():
+                    w.update_sources(self.screens, self.windows)
+                    if s_idx < len(qt_screens):
+                        w.set_fps(round(qt_screens[s_idx].refreshRate()))
         else:
             self._proj_fps = 60
         self.statusBar().showMessage(
@@ -5402,8 +5517,86 @@ class Main(QMainWindow):
         self.proj_btn.setEnabled(True)
         self.statusBar().showMessage(
             f"Selected: {cfg.display_name} — click Project to send to screen")
-        if any(p.isVisible() for p in self.projectors):
+        if any(p.isVisible() for p in self.projectors.values()):
             self._project()
+
+    def _on_pad_target_changed(self, pad_idx: int, target_screen):
+        self.pads[pad_idx].target_screen = target_screen
+        self.pad_widgets[pad_idx].update_cfg(self.pads[pad_idx])
+        label = ("Global Output" if target_screen is None else
+                 "All External" if target_screen == -1 else
+                 f"Display {target_screen + 1}")
+        self.statusBar().showMessage(f"Pad {pad_idx + 1} output set to: {label}")
+
+    def _resolve_targets(self, cfg: Optional[PadConfig]) -> Optional[List[ScreenInfo]]:
+        ext = Bridge.external_screens()
+        if cfg and cfg.target_screen is not None:
+            if cfg.target_screen == -1:
+                if ext:
+                    return ext
+            else:
+                match = [s for s in self.screens if s.index == cfg.target_screen]
+                if match:
+                    return match
+        return self._pick_displays()
+
+    def _sync_pad_states(self):
+        active_pads = set(self._screen_pad.values())
+        self._quad_projecting = QUAD_PAD in active_pads
+        for i, cfg in enumerate(self.pads):
+            cfg.projected = (i in active_pads)
+            if i == CAMERA_PIP_PAD:
+                self.pad_widgets[i].set_state(webcam=self._pip_active)
+            elif i == WEBCAM_PAD_VIDEO:
+                self.pad_widgets[i].set_state(
+                    webcam=(self._webcam_active_pad == WEBCAM_PAD_VIDEO))
+            else:
+                self.pad_widgets[i].set_state(
+                    projected=cfg.projected, selected=(i == self.selected))
+
+    def _project_to_targets(self, pad_idx: int, targets: List[ScreenInfo],
+                            quad_pads: Optional[List[PadConfig]] = None):
+        sz_pct, margin, rounded = self._pip_settings()
+        qt_screens = QApplication.screens()
+        for screen in targets:
+            s_idx = screen.index
+            p = self.projectors.get(s_idx)
+            if p is None:
+                p = Projector()
+                self.projectors[s_idx] = p
+            p.place(screen)
+            if self._pip_active and self._pip_frame:
+                p.set_pip(self._pip_frame, sz_pct, margin, rounded)
+            p.showFullScreen()
+
+            self._screen_pad[s_idx] = pad_idx
+            w = self.proj_workers.get(s_idx)
+            if w is None:
+                w = ProjectorThread()
+                w.frame.connect(
+                    lambda px, si=s_idx: self._on_proj_frame(si, px))
+                w.error.connect(
+                    lambda msg, si=s_idx: self._on_proj_error(si, msg))
+                self.proj_workers[s_idx] = w
+            fps = (round(qt_screens[s_idx].refreshRate())
+                   if s_idx < len(qt_screens) else self._proj_fps)
+            if quad_pads is not None:
+                w.set_quad_mode(quad_pads, self.screens, self.windows)
+            else:
+                w.set_target(self.pads[pad_idx], self.screens, self.windows)
+            w.set_fps(fps)
+            if not w.isRunning():
+                w.start()
+
+        self._program_screen_idx = targets[0].index
+        self._sync_pad_states()
+        self.proj_btn.setText("PROJECTING...")
+        self.stop_btn.setEnabled(True)
+        disp = ", ".join(f"Display {s.index + 1}" for s in targets)
+        src_name = ("Quad View — Pads 1–4" if quad_pads is not None
+                    else self.pads[pad_idx].display_name)
+        self.prog_monitor.set_status(True, src_name, disp)
+        self.statusBar().showMessage(f"Projecting: {src_name}  →  {disp}")
 
     def _pick_displays(self) -> Optional[List[ScreenInfo]]:
         ext = Bridge.external_screens()
@@ -5432,70 +5625,23 @@ class Main(QMainWindow):
     def _project(self):
         if self.selected is None:
             return
-        targets = self._pick_displays()
+        targets = self._resolve_targets(self.pads[self.selected])
         if not targets:
             return
-
-        for p in self.projectors:
-            p.hide()
-        self.projectors = []
-
-        sz_pct, margin, rounded = self._pip_settings()
-        for screen in targets:
-            p = Projector()
-            p.place(screen)
-            if self._pip_active and self._pip_frame:
-                p.set_pip(self._pip_frame, sz_pct, margin, rounded)
-            p.showFullScreen()
-            self.projectors.append(p)
-
-        self._quad_projecting = False
-        for i, cfg in enumerate(self.pads):
-            cfg.projected = (i == self.selected)
-            if i == CAMERA_PIP_PAD:
-                self.pad_widgets[i].set_state(webcam=self._pip_active)
-            elif i == WEBCAM_PAD_VIDEO:
-                self.pad_widgets[i].set_state(
-                    webcam=(self._webcam_active_pad == WEBCAM_PAD_VIDEO))
-            else:
-                self.pad_widgets[i].set_state(
-                    projected=cfg.projected, selected=(i == self.selected))
-
-        pad = self.pads[self.selected]
-        if self.proj_worker is None:
-            self.proj_worker = ProjectorThread()
-            self.proj_worker.frame.connect(self._on_proj_frame)
-            self.proj_worker.error.connect(self._on_proj_error)
-        self.proj_worker.set_target(pad, self.screens, self.windows)
-        self.proj_worker.set_fps(self._proj_fps)
-        if not self.proj_worker.isRunning():
-            self.proj_worker.start()
-
-        self.proj_btn.setText("PROJECTING...")
-        self.stop_btn.setEnabled(True)
-        disp = ", ".join(s.name for s in targets)
-        self.prog_monitor.set_status(True, pad.display_name, disp)
-        self.statusBar().showMessage(
-            f"Projecting: {pad.display_name}  →  {disp}  {self._proj_fps} fps")
+        self._project_to_targets(self.selected, targets)
 
     def _stop(self):
-        if self.proj_worker:
-            self.proj_worker.stop()
-            self.proj_worker.wait(1000)
-            self.proj_worker = None
-        for p in self.projectors:
+        for w in self.proj_workers.values():
+            w.stop()
+        for w in self.proj_workers.values():
+            w.wait(1000)
+        self.proj_workers.clear()
+        for p in self.projectors.values():
             p.hide()
-        self.projectors = []
-        self._quad_projecting = False
-        for i, cfg in enumerate(self.pads):
-            cfg.projected = False
-            if i == CAMERA_PIP_PAD:
-                self.pad_widgets[i].set_state(webcam=self._pip_active)
-            elif i == WEBCAM_PAD_VIDEO:
-                self.pad_widgets[i].set_state(
-                    webcam=(self._webcam_active_pad == WEBCAM_PAD_VIDEO))
-            else:
-                self.pad_widgets[i].set_state(selected=(i == self.selected))
+        self.projectors.clear()
+        self._screen_pad.clear()
+        self._program_screen_idx = None
+        self._sync_pad_states()
         self.proj_btn.setText("PROJECT")
         self.stop_btn.setEnabled(False)
         self.prog_monitor.set_status(False)
@@ -5511,34 +5657,10 @@ class Main(QMainWindow):
                 self, "No Sources",
                 "Configure at least one of Pads 1–4 before using Quad Project.")
             return
-        targets = self._pick_displays()
+        targets = self._resolve_targets(self.pads[QUAD_PAD])
         if not targets:
             return
-        self._stop()
-        self._quad_projecting = True
-        sz_pct, margin, rounded = self._pip_settings()
-        for screen in targets:
-            p = Projector()
-            p.place(screen)
-            if self._pip_active and self._pip_frame:
-                p.set_pip(self._pip_frame, sz_pct, margin, rounded)
-            p.showFullScreen()
-            self.projectors.append(p)
-        if self.proj_worker is None:
-            self.proj_worker = ProjectorThread()
-            self.proj_worker.frame.connect(self._on_proj_frame)
-            self.proj_worker.error.connect(self._on_proj_error)
-        self.proj_worker.set_quad_mode(quad_pads, self.screens, self.windows)
-        self.proj_worker.set_fps(self._proj_fps)
-        if not self.proj_worker.isRunning():
-            self.proj_worker.start()
-        self.pad_widgets[QUAD_PAD].set_state(projected=True)
-        self.stop_btn.setEnabled(True)
-        self.proj_btn.setText("PROJECTING...")
-        disp = ", ".join(s.name for s in targets)
-        self.prog_monitor.set_status(True, "Quad View — Pads 1–4", disp)
-        self.statusBar().showMessage(
-            f"Quad projecting Pads 1–4  →  {disp}  {self._proj_fps} fps")
+        self._project_to_targets(QUAD_PAD, targets, quad_pads=quad_pads)
 
     # ── Camera PIP (Pad 6) ────────────────────────────────────────────────────
 
@@ -5593,7 +5715,7 @@ class Main(QMainWindow):
         self.pip_toggle_btn.style().unpolish(self.pip_toggle_btn)
         self.pip_toggle_btn.style().polish(self.pip_toggle_btn)
         self.prog_monitor.set_pip(None)
-        for p in self.projectors:
+        for p in self.projectors.values():
             p.set_pip(None)
         self.statusBar().showMessage("Camera PIP OFF")
 
@@ -5606,7 +5728,7 @@ class Main(QMainWindow):
         self.pad_widgets[CAMERA_PIP_PAD].set_frame(px)
         sz_pct, margin, rounded = self._pip_settings()
         self.prog_monitor.set_pip(px, sz_pct, margin, rounded)
-        for p in self.projectors:
+        for p in self.projectors.values():
             if p.isVisible():
                 p.set_pip(px, sz_pct, margin, rounded)
 
@@ -5666,7 +5788,7 @@ class Main(QMainWindow):
     def _configure(self, idx: int):
         cfg = self.pads[idx]
         if idx == MEDIA_PAD:
-            dlg = MediaConfigDialog(cfg, self)
+            dlg = MediaConfigDialog(cfg, self.screens, self)
             if dlg.exec_() == QDialog.Accepted:
                 self.pad_widgets[idx].update_cfg(cfg)
                 self._refresh_media_thumbnail(cfg)
@@ -5741,37 +5863,47 @@ class Main(QMainWindow):
         else:
             self._refresh()
 
-    def _on_proj_frame(self, px: QPixmap):
-        name = ("Quad View — Pads 1–4" if self._quad_projecting else
-                self.pads[self.selected].display_name if self.selected is not None else "")
-        self.prog_monitor.push(px)
-        if (not self._quad_projecting and self.selected == MEDIA_PAD
-                and self.pads[MEDIA_PAD].stype == SourceType.VIDEO):
+    def _on_proj_frame(self, screen_idx: int, px: QPixmap):
+        pad_idx = self._screen_pad.get(screen_idx)
+        name = ("Quad View — Pads 1–4" if pad_idx == QUAD_PAD else
+                self.pads[pad_idx].display_name if pad_idx is not None else "")
+        if screen_idx == self._program_screen_idx:
+            self.prog_monitor.push(px)
+        if pad_idx == MEDIA_PAD and self.pads[MEDIA_PAD].stype == SourceType.VIDEO:
             self.pad_widgets[MEDIA_PAD].set_frame(px)
-        for p in self.projectors:
-            if p.isVisible():
-                p.push(px, name)
+        p = self.projectors.get(screen_idx)
+        if p and p.isVisible():
+            p.push(px, name)
 
-    def _on_proj_error(self, msg: str):
-        self._stop()
+    def _on_proj_error(self, screen_idx: int, msg: str):
+        w = self.proj_workers.pop(screen_idx, None)
+        if w:
+            w.stop()
+            w.wait(1000)
+        p = self.projectors.pop(screen_idx, None)
+        if p:
+            p.hide()
+        self._screen_pad.pop(screen_idx, None)
+        self._sync_pad_states()
+        if not self.projectors:
+            self._stop()
         QMessageBox.warning(self, "Projection Error", msg)
 
     def _display_settings(self):
-        ext = Bridge.external_screen()
-        dlg = DisplaySettingsDialog(ext, self)
+        dlg = DisplaySettingsDialog(self.screens, self)
         dlg.exec_()
         self._refresh()
 
     def closeEvent(self, e):
-        all_threads = [self.cam_worker, self.webcam_worker,
-                       self.proj_worker, self.worker]
+        all_threads = ([self.cam_worker, self.webcam_worker, self.worker]
+                       + list(self.proj_workers.values()))
         for w in all_threads:
             if w:
                 w.stop()
         for w in all_threads:
             if w:
                 w.wait(2000)
-        for p in self.projectors:
+        for p in self.projectors.values():
             p.close()
         super().closeEvent(e)
 
