@@ -2933,9 +2933,15 @@ class Capture:
             hwnd = int(hwnd_str)
             if not win32gui.IsWindow(hwnd):
                 return None
+            # IsIconic fires at the START of the minimize animation;
+            # GetWindowPlacement only updates after it finishes (~200 ms later).
+            # Checking IsIconic first prevents PrintWindow capturing a black frame
+            # during the animation.
+            if ctypes.windll.user32.IsIconic(hwnd):
+                return None
             placement = win32gui.GetWindowPlacement(hwnd)
             if placement[1] == win32con.SW_SHOWMINIMIZED:
-                return None  # minimized — caller returns None to hold last frame
+                return None
             rect = win32gui.GetWindowRect(hwnd)
             w = rect[2] - rect[0]
             h = rect[3] - rect[1]
@@ -2977,9 +2983,11 @@ class Capture:
                 try:
                     hwnd = int(win.id)
                     if win32gui.IsWindow(hwnd):
+                        if ctypes.windll.user32.IsIconic(hwnd):
+                            return None  # animate-to-minimize started; hold last frame
                         placement = win32gui.GetWindowPlacement(hwnd)
                         if placement[1] == win32con.SW_SHOWMINIMIZED:
-                            return None  # hold last projected frame; don't capture minimized
+                            return None
                 except Exception:
                     pass
                 px = cls.grab_window_win32(win.id)
@@ -3049,6 +3057,7 @@ class ProjectorThread(QThread):
         self._fps    = 60
         self._live   = False
         self._mu     = threading.Lock()
+        self._last_frame: Optional[QPixmap] = None  # freeze-on-minimise cache
 
     def set_target(self, cfg: PadConfig, screens: List[ScreenInfo],
                    windows: List[WinInfo]):
@@ -3057,6 +3066,7 @@ class ProjectorThread(QThread):
             self._quad_mode  = False
             self._screens    = screens[:]
             self._windows    = windows[:]
+            self._last_frame = None
 
     def set_quad_mode(self, pads: List["PadConfig"], screens: List[ScreenInfo],
                       windows: List[WinInfo]):
@@ -3066,6 +3076,7 @@ class ProjectorThread(QThread):
             self._cfg        = None
             self._screens    = screens[:]
             self._windows    = windows[:]
+            self._last_frame = None
 
     def update_sources(self, screens: List[ScreenInfo], windows: List[WinInfo]):
         with self._mu:
@@ -3088,11 +3099,17 @@ class ProjectorThread(QThread):
             if quad:
                 composite = self._compose_quad(pads, ss, ws)
                 if composite:
+                    self._last_frame = composite
                     self.frame.emit(composite)
+                elif self._last_frame:
+                    self.frame.emit(self._last_frame)  # freeze on minimised quad pad
             elif cfg and cfg.stype not in (SourceType.EMPTY, SourceType.VIDEO):
                 px = Capture.for_pad(cfg, ss, ws)
                 if px:
+                    self._last_frame = px
                     self.frame.emit(px)
+                elif self._last_frame:
+                    self.frame.emit(self._last_frame)  # freeze on minimised window
             dt = time.time() - t0
             time.sleep(max(0.0, 1.0 / self._fps - dt))
 
