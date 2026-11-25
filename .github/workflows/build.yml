@@ -21,7 +21,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install PyQt5 mss pywin32 pyinstaller pyvirtualcam numpy opencv-python
+          pip install PyQt5 mss pywin32 pyinstaller pyvirtualcam numpy opencv-python uiautomation
 
       - name: Build exe
         run: |
@@ -39,6 +39,7 @@ jobs:
             --hidden-import=pyvirtualcam `
             --hidden-import=numpy `
             --hidden-import=cv2 `
+            --hidden-import=uiautomation `
             --collect-submodules=mss `
             --collect-submodules=pyvirtualcam `
             projection_pad.py

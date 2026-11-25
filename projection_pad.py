@@ -54,8 +54,14 @@ if PLATFORM == "Windows":
         HAS_WIN32 = True
     except ImportError:
         HAS_WIN32 = False
+    try:
+        import uiautomation as auto
+        HAS_UIA = True
+    except ImportError:
+        HAS_UIA = False
 else:
     HAS_WIN32 = False
+    HAS_UIA = False
 
 try:
     import numpy as np
@@ -2757,6 +2763,7 @@ class SourceType(Enum):
     EMPTY  = "empty"
     SCREEN = "screen"
     WINDOW = "window"
+    TAB    = "tab"
     IMAGE  = "image"
     VIDEO  = "video"
 
@@ -2933,6 +2940,89 @@ class Bridge:
             except Exception:
                 pass
         return wins
+
+    @staticmethod
+    def browser_tabs() -> List[tuple]:
+        """Return list of (hwnd_str, tab_title, app_name) for open browser tabs."""
+        if PLATFORM != "Windows" or not (HAS_WIN32 and HAS_UIA):
+            return []
+        browser_exes = ("chrome.exe", "msedge.exe", "brave.exe",
+                        "opera.exe", "vivaldi.exe", "firefox.exe")
+        tabs: List[tuple] = []
+        wins = Bridge._wins_win32()
+        for w in wins:
+            if w.app.lower() not in browser_exes:
+                continue
+            try:
+                hwnd = int(w.id)
+                with auto.UIAutomationInitializerInThread():
+                    ctrl = auto.ControlFromHandle(hwnd)
+                    if not ctrl:
+                        continue
+                    seen = set()
+                    # Walk shallowly for TabItemControl
+                    queue = [(ctrl, 0)]
+                    while queue:
+                        node, depth = queue.pop(0)
+                        if depth > 8:
+                            continue
+                        if node.ControlType == auto.ControlType.TabItemControl:
+                            name = (node.Name or "").strip()
+                            if name and name not in seen:
+                                seen.add(name)
+                                tabs.append((w.id, name, w.app))
+                            continue
+                        try:
+                            for ch in node.GetChildren():
+                                queue.append((ch, depth + 1))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return tabs
+
+    @staticmethod
+    def activate_browser_tab(hwnd_str: str, tab_title: str) -> bool:
+        """Switch a browser window to the specified tab via UI Automation."""
+        if PLATFORM != "Windows" or not (HAS_WIN32 and HAS_UIA):
+            return False
+        try:
+            hwnd = int(hwnd_str)
+            with auto.UIAutomationInitializerInThread():
+                ctrl = auto.ControlFromHandle(hwnd)
+                if not ctrl:
+                    return False
+                queue = [(ctrl, 0)]
+                while queue:
+                    node, depth = queue.pop(0)
+                    if depth > 8:
+                        continue
+                    if node.ControlType == auto.ControlType.TabItemControl:
+                        name = (node.Name or "").strip()
+                        if name == tab_title or tab_title in name:
+                            try:
+                                pat = node.GetSelectionItemPattern()
+                                if pat:
+                                    pat.Select()
+                                    return True
+                            except Exception:
+                                pass
+                            try:
+                                pat = node.GetInvokePattern()
+                                if pat:
+                                    pat.Invoke()
+                                    return True
+                            except Exception:
+                                pass
+                        continue
+                    try:
+                        for ch in node.GetChildren():
+                            queue.append((ch, depth + 1))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return False
 
     @staticmethod
     def cameras(max_probe: int = 6) -> List[int]:
@@ -3118,6 +3208,20 @@ class Capture:
                 return cls.grab_window_win32(win.id)
             if win.bounds:
                 return cls.grab(*win.bounds)
+        if cfg.stype == SourceType.TAB and cfg.sid and "|" in cfg.sid:
+            hwnd_str, tab_title = cfg.sid.split("|", 1)
+            if PLATFORM == "Windows" and HAS_WIN32:
+                try:
+                    hwnd = int(hwnd_str)
+                    if not win32gui.IsWindow(hwnd):
+                        return None
+                    win_title = win32gui.GetWindowText(hwnd) or ""
+                    # Freeze on last frame when user switches to another tab
+                    if tab_title not in win_title:
+                        return None
+                except Exception:
+                    return None
+                return cls.grab_window_win32(hwnd_str)
         return None
 
 # ── capture worker thread ──────────────────────────────────────────────────────
@@ -4289,8 +4393,18 @@ class ConfigDialog(QDialog):
         gb = QGroupBox("Source Type")
         tl = QHBoxLayout(gb)
         self.type_cb = QComboBox()
-        self.type_cb.addItems(["Empty", "Entire Screen / Display", "Specific Window"])
-        idx_map = {SourceType.EMPTY: 0, SourceType.SCREEN: 1, SourceType.WINDOW: 2}
+        self.type_cb.addItems([
+            "Empty",
+            "Entire Screen / Display",
+            "Specific Window",
+            "Browser Tab (Chrome / Edge)",
+        ])
+        idx_map = {
+            SourceType.EMPTY: 0,
+            SourceType.SCREEN: 1,
+            SourceType.WINDOW: 2,
+            SourceType.TAB: 3,
+        }
         self.type_cb.setCurrentIndex(idx_map.get(self.cfg.stype, 0))
         self.type_cb.currentIndexChanged.connect(self._fill)
         tl.addWidget(self.type_cb)
@@ -4346,6 +4460,22 @@ class ConfigDialog(QDialog):
                 self.src_list.addItem(item)
                 if self.cfg.stype == SourceType.WINDOW and self.cfg.sid == w.id:
                     self.src_list.setCurrentItem(item)
+        elif ti == 3:
+            tabs = Bridge.browser_tabs()
+            if not tabs:
+                msg = ("uiautomation not installed (pip install uiautomation)"
+                       if not HAS_UIA else "No open browser tabs found")
+                item = QListWidgetItem(msg)
+                item.setFlags(Qt.NoItemFlags)
+                self.src_list.addItem(item)
+            for hwnd_str, tab_title, app in tabs:
+                sid = f"{hwnd_str}|{tab_title}"
+                item = QListWidgetItem(f"{app}: {tab_title}")
+                item.setData(Qt.UserRole, sid)
+                item.setData(Qt.UserRole + 1, tab_title)
+                self.src_list.addItem(item)
+                if self.cfg.stype == SourceType.TAB and self.cfg.sid == sid:
+                    self.src_list.setCurrentItem(item)
 
     def _apply(self):
         ti = self.type_cb.currentIndex()
@@ -4357,12 +4487,18 @@ class ConfigDialog(QDialog):
             self.cfg.sname = "Empty"
         else:
             item = self.src_list.currentItem()
-            if not item:
+            if not item or not (item.flags() & Qt.ItemIsEnabled):
                 QMessageBox.warning(self, "No selection", "Please select a source.")
                 return
-            self.cfg.stype = SourceType.SCREEN if ti == 1 else SourceType.WINDOW
+            type_map = {
+                1: SourceType.SCREEN,
+                2: SourceType.WINDOW,
+                3: SourceType.TAB,
+            }
+            self.cfg.stype = type_map[ti]
             self.cfg.sid   = item.data(Qt.UserRole)
-            self.cfg.sname = item.text()
+            self.cfg.sname = (item.data(Qt.UserRole + 1)
+                              if ti == 3 else item.text())
         self.accept()
 
 # ── video webcam config dialog ─────────────────────────────────────────────────
@@ -5556,6 +5692,11 @@ class Main(QMainWindow):
 
     def _project_to_targets(self, pad_idx: int, targets: List[ScreenInfo],
                             quad_pads: Optional[List[PadConfig]] = None):
+        pad_cfg = self.pads[pad_idx]
+        if (quad_pads is None and pad_cfg.stype == SourceType.TAB
+                and pad_cfg.sid and "|" in pad_cfg.sid):
+            hwnd_str, tab_title = pad_cfg.sid.split("|", 1)
+            Bridge.activate_browser_tab(hwnd_str, tab_title)
         sz_pct, margin, rounded = self._pip_settings()
         qt_screens = QApplication.screens()
         for screen in targets:
